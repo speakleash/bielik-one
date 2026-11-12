@@ -23,7 +23,7 @@ bielik-one backend speakleash/Bielik-One-11B-v3.0-r1
 bielik-one frontend speakleash/Bielik-One-11B-v3.0-r1
 ```
 
-The package is downloaded to the Hugging Face cache on first use (`--revision` pins a commit). A local directory, for example from `hf download ... --local-dir model`, works the same: `bielik-one backend model`. `bielik-one backend <package> --dry-run` verifies the published checksums and prints the exact vLLM command. The launcher detects the package type and uses the profile validated for it:
+The package is downloaded to the Hugging Face cache on first use (`--revision` pins a commit). A local directory, for example from `hf download ... --local-dir model`, works the same: `bielik-one backend model`. `bielik-one backend <package> --dry-run` verifies the published runtime checksums and prints the exact vLLM command. Startup verification skips the root-level `README.md`, `LICENSE`, `.gitattributes` and `requirements.txt`, so editing or omitting these auxiliary files does not block inference. All other manifest entries, including every weight file, remain fully verified for both the backend and frontend. The launcher detects the package type and uses the profile validated for it:
 
 | Package | Backend | API |
 |---|---|---|

@@ -5,7 +5,7 @@
 
 PACKAGE_DIR is a snapshot of one of the Bielik One Hugging Face repositories (merged or -Adapter). The package
 kind is detected from its files; each kind starts with the profile validated for that package (see its card).
-Published checksums (SHA256SUMS.json) are verified before anything starts. The frontend applies the package's
+Runtime files and weights listed in SHA256SUMS.json are verified before anything starts. The frontend applies the package's
 calibration.json unless --no-calibration is given.
 """
 
@@ -54,6 +54,10 @@ PORTS = {
     "qwen-merged": (8013, 8012),
 }
 
+# These root-level files do not affect inference. Keep them in release manifests
+# for package auditing, but do not let documentation edits block model startup.
+NON_RUNTIME_FILES = frozenset({".gitattributes", "LICENSE", "README.md", "requirements.txt"})
+
 
 def resolve_package(spec: str, revision: str | None = None) -> Path:
     """A local package directory, or a Hugging Face repo id downloaded (or reused) in the HF cache."""
@@ -70,6 +74,7 @@ def resolve_package(spec: str, revision: str | None = None) -> Path:
 
 
 def verify(root: Path) -> dict:
+    """Verify runtime files and all weights; ignore only known root-level auxiliary files."""
     path = root / "SHA256SUMS.json"
     if not path.is_file():
         raise ValueError("SHA256SUMS.json is missing; download the complete repository")
@@ -79,6 +84,8 @@ def verify(root: Path) -> dict:
         pure = PurePosixPath(relative)
         if pure.is_absolute() or "\\" in relative or ".." in pure.parts:
             raise ValueError("Invalid checksum path")
+        if pure.as_posix() in NON_RUNTIME_FILES:
+            continue
         target = root / pure
         if not target.is_file():
             raise ValueError(

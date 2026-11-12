@@ -173,6 +173,73 @@ class LaunchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dry("frontend", d)
 
+    def test_auxiliary_files_can_be_edited_or_omitted(self):
+        names = ("README.md", "LICENSE", ".gitattributes", "requirements.txt")
+        for kind in launch.PORTS:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                for name in names:
+                    (root / name).write_text("published content")
+                package(kind, root)
+                published = json.loads((root / "SHA256SUMS.json").read_text())
+                for name in names:
+                    (root / name).write_text("updated content")
+                for component in ("backend", "frontend"):
+                    self.assertEqual(dry(component, d)["kind"], kind)
+                for name in names:
+                    (root / name).unlink()
+                for component in ("backend", "frontend"):
+                    self.assertEqual(dry(component, d)["kind"], kind)
+                self.assertEqual(launch.verify(root), published)
+
+    def test_all_weight_files_remain_required_and_checksummed(self):
+        names = (
+            "model-00001.safetensors",
+            "adapter/adapter_model.safetensors",
+            "heads.safetensors",
+        )
+        for kind in launch.PORTS:
+            for name in names:
+                with self.subTest(kind=kind, file=name), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    package(kind, root)
+                    target = root / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"published weights")
+                    sums = json.loads((root / "SHA256SUMS.json").read_text())
+                    sums[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+                    (root / "SHA256SUMS.json").write_text(json.dumps(sums))
+                    for component in ("backend", "frontend"):
+                        self.assertEqual(dry(component, d)["kind"], kind)
+                    target.write_bytes(b"corrupted weights")
+                    for component in ("backend", "frontend"):
+                        with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                            dry(component, d)
+                    target.unlink()
+                    for component in ("backend", "frontend"):
+                        with self.assertRaisesRegex(ValueError, "Missing file"):
+                            dry(component, d)
+
+    def test_runtime_metadata_remains_checksummed(self):
+        names = (
+            "config.json", "conversion.json", "serving.json", "calibration.json",
+            "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+        )
+        for name in names:
+            with self.subTest(file=name), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                package("llama-merged", root)
+                target = root / name
+                if not target.exists():
+                    target.write_text("published content")
+                sums = json.loads((root / "SHA256SUMS.json").read_text())
+                sums[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+                (root / "SHA256SUMS.json").write_text(json.dumps(sums))
+                target.write_text("corrupted content")
+                for component in ("backend", "frontend"):
+                    with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                        dry(component, d)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -213,6 +280,26 @@ class PackageSpecTests(unittest.TestCase):
             package("llama-merged", root)
             (root / "SHA256SUMS.json").write_text(json.dumps({"../x": "0"}))
             with self.assertRaises(ValueError):
+                launch.verify(root)
+
+    def test_auxiliary_names_do_not_bypass_path_validation(self):
+        for name in ("../README.md", "/LICENSE", "..\\requirements.txt"):
+            with self.subTest(file=name), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / "SHA256SUMS.json").write_text(json.dumps({name: "0" * 64}))
+                with self.assertRaisesRegex(ValueError, "Invalid checksum path"):
+                    launch.verify(root)
+
+    def test_auxiliary_exclusions_apply_only_at_package_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            target = root / "adapter" / "README.md"
+            target.parent.mkdir()
+            target.write_text("changed")
+            (root / "SHA256SUMS.json").write_text(
+                json.dumps({"adapter/README.md": "0" * 64})
+            )
+            with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
                 launch.verify(root)
 
 
