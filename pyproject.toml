@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bielik-one"
+version = "1.0.8"
+description = "Serve Bielik One decision models with vLLM: typed decision API (choice, binary, score, labels), calibration and launcher"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2.9", "huggingface_hub", "transformers>=5.16.1,<5.20", "torch"]
+
+[project.optional-dependencies]
+vllm = ["vllm==0.32.0"]
+test = ["pytest", "safetensors"]
+
+[project.scripts]
+bielik-one = "bielik_one.launch:main"
+
+[tool.setuptools]
+packages = ["bielik_one", "bielik_one.api", "bielik_one.prompting"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

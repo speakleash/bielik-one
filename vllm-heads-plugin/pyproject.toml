@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "systemone-vllm-heads"
+version = "0.4.0"
+description = "Bielik One decision heads for vLLM (Qwen3.5 and Bielik architectures)"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = ["safetensors"]
+
+[project.entry-points."vllm.general_plugins"]
+systemone_heads = "systemone_vllm_heads:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

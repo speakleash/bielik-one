@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # CPU-only: the tests use synthetic vLLM backends; GPU parity checks are run by maintainers.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (CPU PyTorch, no vLLM)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[test]"
+      - name: Tests
+        run: pytest -q
+      - name: Build packages
+        run: |
+          pip install build
+          python -m build --sdist --wheel --outdir dist .
+          python -m build --sdist --wheel --outdir dist vllm-heads-plugin
