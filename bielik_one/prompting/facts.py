@@ -88,7 +88,7 @@ T = {
         hours="Od {a} do {b}: {h} godz. {m} min", mrange="{a} - {b}: {n} mies. (licząc oba miesiące)",
         mtotal="Okresy razem (bez podwójnego liczenia): {n} mies. = {y} lat i {m} mies.",
         per_person="{a} ÷ {n} osób = {r}", found="W tekście jest {what}: {value}",
-        missing="W tekście nie ma: {what}", calendar="kalendarzowo",
+        missing="W tekście nie ma: {what}",
         what=dict(account="numer rachunku bankowego", email="adres e-mail", postal="kod pocztowy")),
     "en": dict(
         holiday="a day off named in the text", today="today", before="{n} {u} before today", after="{n} {u} after today",
@@ -98,7 +98,7 @@ T = {
         hours="From {a} to {b}: {h} h {m} min", mrange="{a} - {b}: {n} months (counting both months)",
         mtotal="Periods in total (overlaps counted once): {n} months = {y} years and {m} months",
         per_person="{a} ÷ {n} persons = {r}", found="The text contains {what}: {value}",
-        missing="The text contains no {what}", calendar="calendar",
+        missing="The text contains no {what}",
         what=dict(account="bank account number", email="e-mail address", postal="postcode")),
     "de": dict(
         holiday="im Text genannter freier Tag", today="heute", before="{n} {u} vor dem heutigen Datum", after="{n} {u} nach dem heutigen Datum",
@@ -108,7 +108,7 @@ T = {
         hours="Von {a} bis {b}: {h} Std. {m} Min.", mrange="{a} - {b}: {n} Monate (beide Monate mitgezählt)",
         mtotal="Zeiträume insgesamt (Überschneidungen einmal gezählt): {n} Monate = {y} Jahre und {m} Monate",
         per_person="{a} ÷ {n} Personen = {r}", found="Der Text enthält {what}: {value}",
-        missing="Der Text enthält keine {what}", calendar="Kalender",
+        missing="Der Text enthält keine {what}",
         what=dict(account="Kontonummer (IBAN)", email="E-Mail-Adresse", postal="Postleitzahl")),
     "nb": dict(
         holiday="fridag nevnt i teksten", today="i dag", before="{n} {u} før dagens dato", after="{n} {u} etter dagens dato",
@@ -118,7 +118,7 @@ T = {
         hours="Fra {a} til {b}: {h} t {m} min", mrange="{a} - {b}: {n} måneder (begge månedene medregnet)",
         mtotal="Periodene til sammen (overlapp telt én gang): {n} måneder = {y} år og {m} måneder",
         per_person="{a} ÷ {n} personer = {r}", found="Teksten inneholder {what}: {value}",
-        missing="Teksten inneholder ikke {what}", calendar="kalender",
+        missing="Teksten inneholder ikke {what}",
         what=dict(account="kontonummer", email="e-postadresse", postal="postnummer")),
 }
 
@@ -141,7 +141,8 @@ for _names in (
     for _i, _n in enumerate(_names.split()):
         MONTHS.setdefault(_n, _i + 1)
 MONTHS.update({"sept": 9, "maerz": 3, "mär": 3, "okt": 10, "dez": 12, "des": 12, "mai": 5})
-_MONTH_RX = "|".join(sorted(MONTHS, key=len, reverse=True))
+# Norwegian "des" only as "des.": a bare "des" is the German article ("Artikel 5 des 2020 erlassenen Gesetzes").
+_MONTH_RX = "|".join(sorted((n for n in MONTHS if n != "des"), key=len, reverse=True)) + r"|des(?=\.)"
 
 DATE_TXT = re.compile(r"(?<![\w.])(\d{1,2})(?:\.|st|nd|rd|th)?\s+(" + _MONTH_RX + r")\.?,?\s+(\d{4})(?!\d)", re.I)
 DATE_US = re.compile(r"\b(" + _MONTH_RX + r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})(?!\d)", re.I)
@@ -153,7 +154,7 @@ TIME_BEFORE = re.compile(r"^[\s,]*(?:on|am|den|w|på|the|,|\s)*(?:[A-Za-zÀ-ž]+
                          r"poniedziałek|wtorek|środ[aę]|czwartek|piątek|sobot[aę]|niedziel[aę])?,?\s*$")
 TIME_AFTER = re.compile(r"^[\s,]*(?:r\.)?[\s,]*(?:o|at|um|kl\.?|klokka|klokken|godz\.|ok\.|około|ca\.|gegen)?"
                         r"\s*(?:godz\.)?\s*$")
-TODAY = re.compile(r"\b(?:dziś|dzisiaj|today|heute|i dag|dagens dato|stand)\b", re.I)
+TODAY = re.compile(r"\b(?:(?i:dziś|dzisiaj|today|heute|i dag|dagens dato)|Stand)\b")
 SENT_END = re.compile(r"[.;!?](?=\s+[A-ZĄĆĘŁŃÓŚŹŻÄÖÜÆØÅ\"'(\[-])|\n")
 
 PRESENT = r"(?:obecnie|nadal|dziś|present|now|today|current|heute|jetzt|aktuell|dato|nå|i dag)"
@@ -194,11 +195,11 @@ _UNIT_SUFFIX = [
     ("ECTS", r"ECTS"),
 ]
 _NUM = r"\d{1,3}(?:[   .,]\d{3}){1,6}(?:[.,]\d{1,6})?|\d{1,15}(?:[.,]\d{1,6})?"  # bounded: no backtracking blow-up
-AMOUNT_SUFFIX = re.compile(r"(?<![\w.,/-])(?:(" + _NUM + r")\s?[-–]\s?)?(" + _NUM + r")\s?(?:"
+AMOUNT_SUFFIX = re.compile(r"(?<![\w.,/\-−])(?:(" + _NUM + r")\s?[-–]\s?)?(" + _NUM + r")\s?(?:"
                            + "|".join(f"(?P<u{i}>{rx})"
                                       for i, (u, rx) in enumerate(_UNIT_SUFFIX)) + r")(?![\w])")
 _SUFFIX_GROUPS = [(f"u{i}", u) for i, (u, _) in enumerate(_UNIT_SUFFIX)]
-AMOUNT_PREFIX = re.compile(r"(£|€|\$|\b(?:GBP|EUR|USD|NOK|PLN|CHF|SEK|DKK|kr\.?))\s?(" + _NUM + r")(?![\d])", re.I)
+AMOUNT_PREFIX = re.compile(r"(?<![\-−])(£|€|\$|\b(?:GBP|EUR|USD|NOK|PLN|CHF|SEK|DKK|kr\.?))\s?(" + _NUM + r")(?![\d])", re.I)
 
 PERSONS = re.compile(r"\b(\d{1,2})\s+(?:osob[ya]?|osób|członk\w+|persons?|people|Personen|personer|"
                      r"members|Mitglieder|medlemmer)\b", re.I)
@@ -206,7 +207,8 @@ PER_PERSON = re.compile(r"\b(?:na osobę|na jedną osobę|per person|per capita|
                         r"per hode)\b", re.I)
 NOT_ADDITIVE = {"mm", "cm", "m²"}  # dimensions of one piece are compared, not added
 # The rule speaks of a total: amounts of one sentence are then added up (a list is always added up).
-SUM_WORDS = re.compile(r"\b(?:sum\w*|łączn\w*|razem|w sumie|dodaj\w*|total\w*|combined|altogether|add\w*|together|"
+SUM_WORDS = re.compile(r"\b(?:sum(?!mar(?:y|ies)|mers?\b)\w*|łączn\w*|razem|dodaj\w*|total\w*|combined|altogether|"
+                       r"add(?!ress|ition)\w*|together|"
                        r"insgesamt|zusammen\w*|gesamt\w*|addier\w*|til sammen|samlet|totalt|legg\w* sammen)\b", re.I)
 # The rule counts from today: today + / - each duration is computed.
 TODAY_RULE = re.compile(r"\b(?:dziś|dzisiaj|dzisiejsz\w*|today|heute|heutig\w*|i dag|dagens)\b", re.I)
@@ -252,10 +254,6 @@ def _sentence_bounds(text: str) -> list[int]:
 
 def _sent(bounds: list[int], pos: int) -> int:
     return bisect_right(bounds, pos - 1)
-
-
-def _iso(d: date) -> str:
-    return d.isoformat()
 
 
 def _plural(lang: str, unit: str, n: int) -> str:
@@ -332,7 +330,8 @@ def _make_date(y, m, d):
 
 def find_dates(text: str) -> list[_Date]:
     """Full dates (with a year) in order of appearance. Numeric d/m/y dates are read day first (European order),
-    month first only when the day-first reading is impossible."""
+    month first when the day-first reading is impossible; all slash dates are read month first when the text has a
+    slash date that can only be month first (04/25/2027) and none that can only be day first."""
     found = []
     for m in islice(DATE_TXT.finditer(text), MAX_MATCHES):
         d = _make_date(int(m.group(3)), MONTHS[m.group(2).lower()], int(m.group(1)))
@@ -346,8 +345,14 @@ def find_dates(text: str) -> list[_Date]:
         d = _make_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         if d:
             found.append(_Date(m.start(), m.end(), d))
-    for m in islice(DATE_DMY.finditer(text), MAX_MATCHES):
+    numeric = list(islice(DATE_DMY.finditer(text), MAX_MATCHES))
+    # A text that writes 04/25/2027 writes its other slash dates month first too, so they are read the same way.
+    slashes = [(int(m.group(1)), int(m.group(3))) for m in numeric if m.group(2) == "/"]
+    month_first = any(b > 12 >= a for a, b in slashes) and not any(a > 12 >= b for a, b in slashes)
+    for m in numeric:
         a, b, y = int(m.group(1)), int(m.group(3)), int(m.group(4))
+        if month_first and m.group(2) == "/":
+            a, b = b, a
         d = _make_date(y, b, a) or _make_date(y, a, b)
         if d:
             found.append(_Date(m.start(), m.end(), d))
@@ -400,7 +405,7 @@ def _holidays(texts: Sequence[str], years: set[int]) -> set[date]:
 def _today(text: str, dates: list[_Date]) -> _Date | None:
     for m in islice(TODAY.finditer(text), MAX_MATCHES):
         for x in dates:
-            if m.end() <= x.start <= m.end() + 40 and "\n" not in text[m.end():x.start]:
+            if m.end() <= x.start <= m.end() + 25 and "\n" not in text[m.end():x.start]:
                 return x
     return None
 
@@ -507,19 +512,18 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
             continue
         unit = next(u for g, u in _SUFFIX_GROUPS if m.group(g))
         sym = next(m.group(g) for g, u in _SUFFIX_GROUPS if m.group(g))
-        if unit == "h" and sym in ("time",) and lang != "nb":
+        if unit == "h" and sym == "time" and lang != "nb":
             continue
         if unit == "NOK" and sym.lower().startswith("kr") and lang == "pl":
             continue
         ranged = m.group(1) is not None
-        tolerance = text[max(0, m.start() - 3):m.start()].rstrip().endswith(("±", "+/-"))
+        if text[max(0, m.start() - 3):m.start()].rstrip().endswith(("±", "+/-")):
+            continue  # a tolerance
         for raw, start in ((m.group(1), m.start(1)), (m.group(2), m.start(2))):
             if raw is None:
                 continue
             v = _number(raw, lang)
             if v is not None:
-                if tolerance:
-                    continue
                 out.append(_Amount(start, m.end(), v, unit, _places(raw, lang), False, sym, ranged))
     out.sort(key=lambda a: a.start)
     return out[:MAX_MATCHES]
@@ -574,21 +578,24 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     def day(d):
         return wd[d.weekday()] + (f"; {t['holiday']}" if d in holidays else "")
 
+    def counts(lo, hi):
+        """The working days (when the text speaks of them) and the full months / years from lo to hi."""
+        out = ""
+        if workdays:
+            out += "; " + t["workdays"].format(w=_workdays_between(lo, hi, holidays), a=lo.isoformat(),
+                                               b=hi.isoformat(), hol=t["hol"] if holidays else "")
+        span = _span(lo, hi, t)
+        return out + ("; " + span if span else "")
+
     for x in events:
-        line = f"{_iso(x.day)} = {day(x.day)}"
+        line = f"{x.day.isoformat()} = {day(x.day)}"
         if today is not None:
             n = (x.day - today.day).days
             if n == 0:
                 line += f" = {t['today']}"
             else:
                 line += "; " + (t["before"] if n < 0 else t["after"]).format(n=abs(n), u=_plural(lang, "d", abs(n)))
-                if workdays:
-                    a, b = sorted((x.day, today.day))
-                    line += "; " + t["workdays"].format(w=_workdays_between(a, b, holidays), a=_iso(a), b=_iso(b),
-                                                       hol=t["hol"] if holidays else "")
-                span = _span(*sorted((x.day, today.day)), t)
-                if span:
-                    line += "; " + span
+                line += counts(*sorted((x.day, today.day)))
         lines.append(line)
     others = [x for x in events if today is None or x.day != today.day]
     pairs = (list(zip(others, others[1:])) if len(others) > 4 or today is not None and len(others) > 3
@@ -596,14 +603,8 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     for a, b in pairs[:MAX_GAPS if today is None else 3]:
         lo, hi = sorted((a.day, b.day))
         n = (hi - lo).days
-        line = t["gap"].format(a=_iso(lo), b=_iso(hi), n=n, u=_plural(lang, "d", n), n1=n + 1)
-        if workdays:
-            line += "; " + t["workdays"].format(w=_workdays_between(lo, hi, holidays), a=_iso(lo), b=_iso(hi),
-                                               hol=t["hol"] if holidays else "")
-        span = _span(lo, hi, t)
-        if span:
-            line += "; " + span
-        lines.append(line)
+        lines.append(t["gap"].format(a=lo.isoformat(), b=hi.isoformat(), n=n, u=_plural(lang, "d", n), n1=n + 1)
+                     + counts(lo, hi))
 
     # --- clock time between dated times
     timed = [x for x in dates if x.time]
@@ -621,16 +622,15 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     for x in anchors:
         for n, unit in durs:
             d = _plus(x.day, n, unit, holidays)
-            plus.append(f"{_iso(x.day)} + {n} {_plural(lang, unit, n)} = {_iso(d)} ({day(d)})")
+            plus.append(f"{x.day.isoformat()} + {n} {_plural(lang, unit, n)} = {d.isoformat()} ({day(d)})")
     if today is not None and TODAY_RULE.search(rule):
         tp = []
         for n, unit in durs:
             d = _plus(today.day, n, unit, holidays)
-            tp.append(f"{_iso(today.day)} ({t['today']}) + {n} {_plural(lang, unit, n)} = {_iso(d)} ({day(d)})")
-            if unit in ("d", "w", "m", "y"):
-                back = (today.day - timedelta(days=n) if unit == "d" else today.day - timedelta(weeks=n) if unit == "w"
-                        else _add_months(today.day, -n * (12 if unit == "y" else 1)))
-                tp.append(f"{_iso(today.day)} ({t['today']}) - {n} {_plural(lang, unit, n)} = {_iso(back)} "
+            tp.append(f"{today.day.isoformat()} ({t['today']}) + {n} {_plural(lang, unit, n)} = {d.isoformat()} ({day(d)})")
+            if unit != "wd":
+                back = _plus(today.day, -n, unit, holidays)
+                tp.append(f"{today.day.isoformat()} ({t['today']}) - {n} {_plural(lang, unit, n)} = {back.isoformat()} "
                           f"({day(back)})")
         lines += tp[:MAX_TODAY_PLUS]
     lines += plus[:MAX_PLUS]

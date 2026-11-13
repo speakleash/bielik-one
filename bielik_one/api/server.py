@@ -38,6 +38,7 @@ KINDS = ("choice", "noul", "score")
 DEFAULT_READ_TWICE_MAX_INPUT_TOKENS = 4096
 MAX_PERMUTATIONS = 16
 MAX_QUESTIONS = 64
+CONTEXT_LIMIT = "context limit exceeded; no truncation"
 MAX_STATE_CHARS = 400_000  # well above a 32768-token context; longer prompts are rejected by the backend anyway
 MAX_QUESTIONS_CHARS = 400_000  # all question names, instructions, option names and texts together
 MAX_PROMPTS = MAX_QUESTIONS * MAX_PERMUTATIONS  # decision reads per request, after per-option expansion
@@ -813,7 +814,15 @@ class LetterEngine:
         extended = inject_facts(state, lines, language)
         if len(extended) > MAX_STATE_CHARS:  # the facts never make a valid request invalid
             lines, extended = [], state
-        result = self.evaluate(body.model_copy(update={"state": extended, "facts": False}))
+        try:
+            result = self.evaluate(body.model_copy(update={"state": extended, "facts": False}))
+        except RequestError as error:
+            # The facts count toward the read-twice threshold and the context like the rest of the state; when the
+            # standard prompt with them no longer fits the context, the request is read without them.
+            if not lines or error.msg != CONTEXT_LIMIT:
+                raise
+            lines = []
+            result = self.evaluate(body.model_copy(update={"state": state, "facts": False}))
         result["facts"] = {"language": language, "lines": lines}
         return result
 

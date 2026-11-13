@@ -338,3 +338,84 @@ def test_working_day_count_matches_a_day_by_day_count():
         slow = sum((a + timedelta(days=i)).weekday() < 5 and a + timedelta(days=i) not in holidays
                    for i in range(1, (b - a).days + 1))
         assert _workdays_between(a, b, holidays) == slow
+
+
+# ------------------------------------------------------------------ facts and read twice
+
+
+def _one_token_per_char(reads):
+    """A synthetic tokenizer for the remote engine: one token per character of the state, the state twice when the
+    prompt repeats it. `reads` records (state, read_twice) of every prompt built."""
+
+    def inference_ids(tok, row, semantic=False, **kwargs):
+        reads.append((row.state, kwargs.get("read_twice", False)))
+        return [1] * (len(row.state) * (2 if kwargs.get("read_twice") else 1) + 10)
+
+    return inference_ids
+
+
+def _remote(engine_factory, monkeypatch, max_model_len=32768):
+    from bielik_one.api import remote_vllm
+
+    reads = []
+    monkeypatch.setattr(remote_vllm, "inference_ids", _one_token_per_char(reads))
+    monkeypatch.setattr(remote_vllm, "answer_token_ids", lambda tok, row, semantic: [1000, 1001])
+    monkeypatch.setattr(server, "answer_token_ids", lambda tok, row, semantic: [1000, 1001])
+    fixture = engine_factory(max_model_len)
+    return fixture, reads
+
+
+def test_facts_are_part_of_the_state_that_read_twice_repeats(engine_factory, monkeypatch):
+    fixture, reads = _remote(engine_factory, monkeypatch)
+    result = fixture.engine.evaluate(request(facts=True))
+    extended = "Kosztorys naprawy: 512,40 zł.\n\n" + HEADER["pl"] + "\n- 512,40 zł > 500 zł"
+    assert reads == [(extended, False), (extended, True)]  # the length check and the repeated prompt both see them
+    assert len(fixture.requests[0]["prompt"]) == 2 * len(extended) + 10
+    assert result["answers"]["q"]["prompt"]["variant"] == "read_twice"
+    assert result["facts"]["lines"] == ["512,40 zł > 500 zł"]
+
+
+def test_facts_count_toward_the_read_twice_threshold(engine_factory, monkeypatch):
+    fixture, reads = _remote(engine_factory, monkeypatch)
+    plain = len("Kosztorys naprawy: 512,40 zł.") + 10
+    result = fixture.engine.evaluate(request(facts=True, read_twice_max_input_tokens=plain))
+    info = result["answers"]["q"]["prompt"]
+    assert (info["variant"], info["reason"]) == ("standard", "input_threshold")
+    assert result["facts"]["lines"] == ["512,40 zł > 500 zł"]
+    assert HEADER["pl"] in reads[0][0]
+
+
+def test_without_room_for_the_facts_the_request_is_read_without_them(engine_factory, monkeypatch):
+    plain = "Kosztorys naprawy: 512,40 zł."
+    fixture, reads = _remote(engine_factory, monkeypatch, max_model_len=len(plain) + 11)
+    result = fixture.engine.evaluate(request(facts=True))
+    assert result["facts"]["lines"] == []
+    assert [state for state, _ in reads][-1] == plain
+    assert len(fixture.requests) == 1 and len(fixture.requests[0]["prompt"]) == len(plain) + 10
+    assert result["answers"]["q"]["prompt"]["reason"] == "context_limit"
+
+
+def test_a_state_too_long_without_facts_is_still_refused(engine_factory, monkeypatch):
+    fixture, _ = _remote(engine_factory, monkeypatch, max_model_len=10)
+    with pytest.raises(server.RequestError, match="context limit"):
+        fixture.engine.evaluate(request(facts=True))
+    assert fixture.requests == []
+
+
+def test_negative_amounts_and_us_slash_dates():
+    assert lines_of("Saldo: -600 zł, opłata −700 zł, zwrot -€800.", "Czy saldo przekracza 500 zł?") == []
+    assert [x.day for x in find_dates("Signed 04/05/2027, delivered 04/25/2027.")] == [date(2027, 4, 5),
+                                                                                        date(2027, 4, 25)]
+    assert [x.day for x in find_dates("Signed 04/05/2027, delivered 25/04/2027.")] == [date(2027, 5, 4),
+                                                                                        date(2027, 4, 25)]
+
+
+def test_today_needs_the_date_right_after_the_word():
+    lines = lines_of("The contract was signed today, and the delivery is due on 5 May 2027.", "Was it on time?")
+    assert not any("today" in x for x in lines)
+    assert any("today" in x for x in lines_of("Today is Wednesday, 5 May 2027.", "Was it on time?"))
+
+
+def test_the_german_article_des_is_not_december():
+    assert find_dates("Nach Artikel 5 des 2020 erlassenen Gesetzes") == []
+    assert [x.day for x in find_dates("Frist: 5. des. 2026")] == [date(2026, 12, 5)]
