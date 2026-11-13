@@ -308,71 +308,72 @@ class RemoteVllmEngine(LetterEngine):
         orders,
         *,
         questions=(),
+        first_rows=(),
         questions_before_state=False,
         read_twice=False,
         read_twice_max_input_tokens=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
         analyses=None,
     ):
-        tasks = []
-        for row in orders:
-            kind = row.question.type
-            if kind == "labels" and len(row.options) > self.labels_capacity:
+        if first_rows and len(first_rows) != len(orders):
+            raise ValueError("Expected one original row per decision read")
+        standard = []
+        groups = {}
+        for index, row in enumerate(orders):
+            if row.question.type == "labels" and len(row.options) > self.labels_capacity:
                 raise RequestError(
                     ["questions", row.id, "criteria"],
                     f"labels supports at most {self.labels_capacity} options",
                 )
             ids = inference_ids(
-                self.tok,
-                row,
-                self.semantic,
-                questions=questions,
-                questions_before_state=questions_before_state,
-                read_twice=False,
+                self.tok, row, self.semantic, questions=questions,
+                questions_before_state=questions_before_state, read_twice=False,
                 analysis=(analyses or {}).get(row.id, ""),
             )
             if len(ids) + 1 > self.max_model_len:
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
                 )
-            standard_tokens = len(ids)
-            applied = False
-            reason = "input_threshold" if read_twice else "disabled"
-            # Count the complete standard prompt, including question previews/analysis.
-            # Repetition is conditional even when explicitly enabled. Never truncate either variant.
-            if read_twice and (
-                read_twice_max_input_tokens is None
-                or len(ids) <= read_twice_max_input_tokens
-            ):
-                repeated = inference_ids(
-                    self.tok,
-                    row,
-                    self.semantic,
-                    questions=questions,
-                    questions_before_state=questions_before_state,
-                    read_twice=True,
-                    analysis=(analyses or {}).get(row.id, ""),
-                )
-                if len(repeated) + 1 <= self.max_model_len:
-                    ids = repeated
-                    applied = True
-                    reason = "applied"
+            standard.append(ids)
+            groups.setdefault(row.id, []).append(index)
+
+        selected = list(standard)
+        decisions = {}
+        for name, indices in groups.items():
+            reason = "disabled"
+            if read_twice:
+                longest = max(len(standard[i]) for i in indices)
+                if read_twice_max_input_tokens is not None and longest > read_twice_max_input_tokens:
+                    reason = "input_threshold"
                 else:
-                    reason = "context_limit"
-            variants = _prompt_variants.get()
+                    repeated = [inference_ids(
+                        self.tok, orders[i], self.semantic,
+                        first_row=first_rows[i] if first_rows else orders[i],
+                        questions=questions, questions_before_state=questions_before_state,
+                        read_twice=True, analysis=(analyses or {}).get(name, ""),
+                    ) for i in indices]
+                    if all(len(ids) + 1 <= self.max_model_len for ids in repeated):
+                        reason = "applied"
+                        for i, ids in zip(indices, repeated, strict=True):
+                            selected[i] = ids
+                    else:
+                        reason = "context_limit"
+            decisions[name] = reason
+
+        tasks = []
+        variants = _prompt_variants.get()
+        for row, base, ids in zip(orders, standard, selected, strict=True):
+            kind = row.question.type
+            reason = decisions[row.id]
             if variants is not None:
-                variants.append((
-                    row.id,
-                    {
-                        "read_twice": applied,
-                        "reason": reason,
-                        "standard_input_tokens": standard_tokens,
-                        "input_tokens": len(ids),
-                    },
-                ))
+                variants.append((row.id, {
+                    "read_twice": reason == "applied",
+                    "reason": reason,
+                    "standard_input_tokens": len(base),
+                    "input_tokens": len(ids),
+                }))
             outputs = (
-                self.parking["option_ids"][: len(row.options)]
-                if kind == "labels"
-                else answer_token_ids(self.tok, row, self.semantic)
+                self.parking["option_ids"][:len(row.options)]
+                if kind == "labels" else answer_token_ids(self.tok, row, self.semantic)
             )
             tasks.append((ids, list(outputs), kind))
         # Each read runs in a copy of the request's context, so it sees the request id.
@@ -393,14 +394,18 @@ class RemoteVllmEngine(LetterEngine):
         for name, answer in result["answers"].items():
             reads = [record for question_id, record in variants if question_id == name]
             if reads:
-                applied = {record["read_twice"] for record in reads}
-                answer["inference"] = {
+                applied = all(record["read_twice"] for record in reads)
+                answer["prompt"] = {
                     "requested_read_twice": body.read_twice,
-                    "read_twice": next(iter(applied)) if len(applied) == 1 else "mixed",
+                    "variant": "read_twice" if applied else "standard",
+                    "reason": reads[0]["reason"],
+                    "read_twice_max_input_tokens": body.read_twice_max_input_tokens,
+                    "max_context_tokens": self.max_model_len,
                     "read_twice_reads": sum(record["read_twice"] for record in reads),
                     "standard_reads": sum(not record["read_twice"] for record in reads),
-                    "reads": reads,
                 }
+                if body.prompt_details:
+                    answer["prompt"]["reads"] = reads
         calls = 0
         seed = 0 if body.seed is None else body.seed
         for question in body.questions.values():

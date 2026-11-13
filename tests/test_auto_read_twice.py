@@ -97,7 +97,7 @@ def test_permutation_metadata(engine_factory, variant):
         index = counters[repeated]
         counters[repeated] += 1
         if not repeated:
-            return [1] * (101 if variant == "threshold" else 100)
+            return [1] * (100 + index if variant == "threshold" else 100)
         return [1] * (200 if variant == "context" or (variant == "mixed" and index) else 199)
 
     with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=prompt), patch(
@@ -107,12 +107,13 @@ def test_permutation_metadata(engine_factory, variant):
             permutations=2,
             read_twice=variant != "disabled",
             read_twice_max_input_tokens=100,
+            prompt_details=True,
         ))
-    info = result["answers"]["q"]["inference"]
-    expected = {"mixed": "mixed", "threshold": False, "context": False, "disabled": False}
-    reasons = {"mixed": ["applied", "context_limit"], "threshold": ["input_threshold"] * 2,
+    info = result["answers"]["q"]["prompt"]
+    expected = {key: "standard" for key in ("mixed", "threshold", "context", "disabled")}
+    reasons = {"mixed": ["context_limit"] * 2, "threshold": ["input_threshold"] * 2,
                "context": ["context_limit"] * 2, "disabled": ["disabled"] * 2}
-    assert info["read_twice"] == expected[variant]
+    assert info["variant"] == expected[variant]
     assert [read["reason"] for read in info["reads"]] == reasons[variant]
     assert info["read_twice_reads"] + info["standard_reads"] == 2
     assert info["requested_read_twice"] is (variant != "disabled")
@@ -122,7 +123,7 @@ def test_permutation_metadata(engine_factory, variant):
 def test_per_option_labels_metadata(engine_factory):
     fixture = engine_factory()
     request = SystemOneIn(
-        model="decision", state="state", permutations=2,
+        model="decision", state="state", permutations=2, prompt_details=True,
         questions={"tags": {"type": "labels", "mode": "per_option",
                             "instructions": "Select tags", "criteria": {"x": "X", "y": "Y"}}},
     )
@@ -130,8 +131,8 @@ def test_per_option_labels_metadata(engine_factory):
         "bielik_one.api.remote_vllm.answer_token_ids", return_value=[1000, 1001]
     ), patch("bielik_one.api.server.answer_token_ids", return_value=[1000, 1001]):
         result = fixture.engine.evaluate(request)
-    info = result["answers"]["tags"]["inference"]
-    assert info["read_twice"] is True
+    info = result["answers"]["tags"]["prompt"]
+    assert info["variant"] == "read_twice"
     assert info["read_twice_reads"] == 4
     assert len(info["reads"]) == 4
 
@@ -173,7 +174,92 @@ def test_metadata_is_request_local_after_error_and_between_threads(engine_factor
         "bielik_one.api.remote_vllm.answer_token_ids", return_value=[1000, 1001]
     ), patch("bielik_one.api.server.answer_token_ids", return_value=[1000, 1001]):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(fixture.engine.evaluate, [body(), body(read_twice=False)]))
-    assert results[0]["answers"]["q"]["inference"]["reads"][0]["reason"] == "context_limit"
-    assert results[1]["answers"]["q"]["inference"]["reads"][0]["reason"] == "disabled"
+            results = list(pool.map(fixture.engine.evaluate, [body(prompt_details=True), body(read_twice=False, prompt_details=True)]))
+    assert results[0]["answers"]["q"]["prompt"]["reads"][0]["reason"] == "context_limit"
+    assert results[1]["answers"]["q"]["prompt"]["reads"][0]["reason"] == "disabled"
     assert _prompt_variants.get() is None
+
+
+def test_compact_metadata_and_opt_in_details(engine_factory):
+    fixture = engine_factory()
+    with patch("bielik_one.api.remote_vllm.inference_ids", return_value=[1] * 100), patch(
+        "bielik_one.api.remote_vllm.answer_token_ids", return_value=[1000, 1001]
+    ), patch("bielik_one.api.server.answer_token_ids", return_value=[1000, 1001]):
+        compact = fixture.engine.evaluate(body())
+        detailed = fixture.engine.evaluate(body(prompt_details=True))
+    info = compact["answers"]["q"]["prompt"]
+    assert "reads" not in info
+    assert "inference" not in compact["answers"]["q"]
+    assert info["variant"] == "read_twice"
+    assert info["read_twice_max_input_tokens"] == DEFAULT_READ_TWICE_MAX_INPUT_TOKENS
+    assert info["max_context_tokens"] == fixture.engine.max_model_len
+    assert len(detailed["answers"]["q"]["prompt"]["reads"]) == 1
+
+
+def test_one_overflowing_per_option_read_disables_whole_question(engine_factory):
+    fixture = engine_factory(200)
+    count = 0
+
+    def prompt(*args, **kwargs):
+        nonlocal count
+        if not kwargs["read_twice"]:
+            return [1] * 100
+        count += 1
+        return [1] * (200 if count == 4 else 199)
+
+    request = SystemOneIn(
+        model="decision", state="state", permutations=2, prompt_details=True,
+        questions={"tags": {"type": "labels", "mode": "per_option",
+                            "instructions": "Pick tags", "criteria": {"x": "X", "y": "Y"}}},
+    )
+    with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=prompt), patch(
+        "bielik_one.api.remote_vllm.answer_token_ids", return_value=[1000, 1001]
+    ), patch("bielik_one.api.server.answer_token_ids", return_value=[1000, 1001]):
+        result = fixture.engine.evaluate(request)
+    info = result["answers"]["tags"]["prompt"]
+    assert info["variant"] == "standard"
+    assert info["reason"] == "context_limit"
+    assert info["standard_reads"] == 4
+    assert all(len(request["prompt"]) == 100 for request in fixture.requests)
+
+
+def test_original_order_forwarded_to_every_permutation(engine_factory):
+    fixture = engine_factory()
+    observed = []
+
+    def prompt(tok, row, semantic, **kwargs):
+        if kwargs["read_twice"]:
+            observed.append(([o.key for o in kwargs["first_row"].options],
+                             [o.key for o in row.options]))
+        return [1] * 100
+
+    request = SystemOneIn(
+        model="decision", state="state", permutations=2,
+        questions={"q": {"type": "choice", "instructions": "Pick one",
+                         "criteria": {"x": "X", "y": "Y"}}},
+    )
+    with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=prompt), patch(
+        "bielik_one.api.remote_vllm.answer_token_ids", return_value=[1000, 1001]
+    ), patch("bielik_one.api.server.answer_token_ids", return_value=[1000, 1001]):
+        fixture.engine.evaluate(request)
+    assert len(observed) == 2
+    assert all(first == ["x", "y"] for first, second in observed)
+    assert {tuple(second) for first, second in observed} == {("x", "y"), ("y", "x")}
+
+
+def test_variants_are_independent_between_questions(engine_factory):
+    fixture = engine_factory()
+    request = SystemOneIn(
+        model="decision", state="state", read_twice_max_input_tokens=100,
+        questions={name: {"type": "noul", "instructions": name} for name in ("short", "long")},
+    )
+
+    def prompt(tok, row, semantic, **kwargs):
+        return [1] * (100 if row.id == "short" else 101)
+
+    with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=prompt), patch(
+        "bielik_one.api.remote_vllm.answer_token_ids", return_value=[1000, 1001]
+    ), patch("bielik_one.api.server.answer_token_ids", return_value=[1000, 1001]):
+        result = fixture.engine.evaluate(request)
+    assert result["answers"]["short"]["prompt"]["variant"] == "read_twice"
+    assert result["answers"]["long"]["prompt"]["variant"] == "standard"
