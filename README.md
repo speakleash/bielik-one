@@ -185,6 +185,13 @@ The tests use synthetic backends and need no GPU.
 
 Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to report bugs, run the tests and check changes that can affect model outputs; report security issues privately through the repository's Security tab.
 
+## Contributors
+
+- [Krzysztof Wróbel](https://github.com/djstrong) — Bielik One decision models, inference engine, calibration, serving tools and tests.
+- [Filip Reka](https://github.com/FIlipHand) — original vLLM middleware integration, serving chat and typed decisions through one API server.
+
+Thank you to everyone who contributes code, reports issues and helps improve Bielik One.
+
 ## License
 
 Apache License 2.0, see `LICENSE`. Model weights are distributed separately under their own licenses.
