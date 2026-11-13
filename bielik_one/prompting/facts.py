@@ -35,10 +35,11 @@ from __future__ import annotations
 
 import math
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from itertools import islice
 
 LANGUAGES = ("pl", "en", "de", "nb")
 
@@ -48,6 +49,10 @@ MAX_HOURS, MAX_MONTH_RANGES = 2, 4
 MAX_SUMS, MAX_PER_PERSON, MAX_COMPARE, MAX_IDS = 4, 2, 6, 3
 MAX_DURATIONS, MAX_ANCHORS = 3, 3
 MAX_CALENDAR = 14  # all date lines together (dates, gaps, clock time, date + duration)
+# The API takes untrusted text: facts read at most this much of the state and of the instructions, and collect at
+# most MAX_MATCHES dates, times and amounts, so the work per request stays small and linear.
+MAX_INPUT_CHARS = 20_000
+MAX_MATCHES = 300
 
 # ------------------------------------------------------------------ words per language
 
@@ -152,7 +157,7 @@ TODAY = re.compile(r"\b(?:dziś|dzisiaj|today|heute|i dag|dagens dato|stand)\b",
 SENT_END = re.compile(r"[.;!?](?=\s+[A-ZĄĆĘŁŃÓŚŹŻÄÖÜÆØÅ\"'(\[-])|\n")
 
 PRESENT = r"(?:obecnie|nadal|dziś|present|now|today|current|heute|jetzt|aktuell|dato|nå|i dag)"
-MONTH_RANGE = re.compile(r"(?<![\d./\-])(0?[1-9]|1[0-2])[./](\d{4})\s*(?:-|–|—|to|bis|til|do)\s*"
+MONTH_RANGE = re.compile(r"(?<![\d./\-])(0?[1-9]|1[0-2])[./](\d{4})\s{0,3}(?:-|–|—|to|bis|til|do)\s{0,3}"
                          r"(?:(0?[1-9]|1[0-2])[./](\d{4})(?![\d./])|" + PRESENT + r"\b)", re.I)
 
 WORKDAY_WORDS = re.compile(r"\b(?:dni robocz|dnia robocz|dzień robocz|working day|business day|werktag|arbeitstag|"
@@ -188,7 +193,7 @@ _UNIT_SUFFIX = [
     ("pt", r"pkt\.?|punkt\w*|points?|Punkte?n?|poeng"),
     ("ECTS", r"ECTS"),
 ]
-_NUM = r"\d{1,3}(?:[   .,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?"
+_NUM = r"\d{1,3}(?:[   .,]\d{3}){1,6}(?:[.,]\d{1,6})?|\d{1,15}(?:[.,]\d{1,6})?"  # bounded: no backtracking blow-up
 AMOUNT_SUFFIX = re.compile(r"(?<![\w.,/-])(?:(" + _NUM + r")\s?[-–]\s?)?(" + _NUM + r")\s?(?:"
                            + "|".join(f"(?P<u{i}>{rx})"
                                       for i, (u, rx) in enumerate(_UNIT_SUFFIX)) + r")(?![\w])")
@@ -218,7 +223,7 @@ ID_PATTERNS = {
                           r"(?<![\d-])\d{2}(?:[ ]?\d{4}){6}(?![\d-])|"  # Polish NRB (26 digits)
                           r"(?<![\d.-])\d{4}[ .]\d{2}[ .]\d{5}(?![\d.-])|"  # Norwegian account (11 digits)
                           r"\b\d{2}-\d{2}-\d{2}\b\D{0,20}\b\d{8}\b"),  # UK sort code and account
-    "email": re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"),
+    "email": re.compile(r"(?<![\w.+-])[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}"),
     "postal": re.compile(r"(?<![\d-])\d{2}-\d{3}(?![\d-])|\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b|"
                          r"(?<![\d-])\d{4,5}\s+[A-ZÄÖÜÆØÅ][a-zäöüßæøå]+"),
 }
@@ -280,12 +285,13 @@ def _is_workday(d: date, holidays: set[date]) -> bool:
 
 
 def _workdays_between(a: date, b: date, holidays: set[date]) -> int:
-    """Working days from the day after a to b inclusive."""
-    n, d = 0, a
-    while d < b:
-        d += timedelta(days=1)
-        n += _is_workday(d, holidays)
-    return n
+    """Working days from the day after a to b inclusive (whole weeks counted at once)."""
+    days = (b - a).days
+    if days <= 0:
+        return 0
+    weeks, rest = divmod(days, 7)
+    n = 5 * weeks + sum((a.weekday() + i) % 7 < 5 for i in range(1, rest + 1))
+    return n - sum(1 for h in holidays if a < h <= b and h.weekday() < 5)
 
 
 def _plus_workdays(a: date, k: int, holidays: set[date]) -> date:
@@ -328,19 +334,19 @@ def find_dates(text: str) -> list[_Date]:
     """Full dates (with a year) in order of appearance. Numeric d/m/y dates are read day first (European order),
     month first only when the day-first reading is impossible."""
     found = []
-    for m in DATE_TXT.finditer(text):
+    for m in islice(DATE_TXT.finditer(text), MAX_MATCHES):
         d = _make_date(int(m.group(3)), MONTHS[m.group(2).lower()], int(m.group(1)))
         if d:
             found.append(_Date(m.start(), m.end(), d))
-    for m in DATE_US.finditer(text):
+    for m in islice(DATE_US.finditer(text), MAX_MATCHES):
         d = _make_date(int(m.group(3)), MONTHS[m.group(1).lower()], int(m.group(2)))
         if d:
             found.append(_Date(m.start(), m.end(), d))
-    for m in DATE_ISO.finditer(text):
+    for m in islice(DATE_ISO.finditer(text), MAX_MATCHES):
         d = _make_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         if d:
             found.append(_Date(m.start(), m.end(), d))
-    for m in DATE_DMY.finditer(text):
+    for m in islice(DATE_DMY.finditer(text), MAX_MATCHES):
         a, b, y = int(m.group(1)), int(m.group(3)), int(m.group(4))
         d = _make_date(y, b, a) or _make_date(y, a, b)
         if d:
@@ -351,13 +357,17 @@ def find_dates(text: str) -> list[_Date]:
         if x.start >= last_end:
             out.append(x)
             last_end = x.end
-    times = [(m.start(), m.end(), int(m.group(1)), int(m.group(2))) for m in TIME.finditer(text)]
+    out = out[:MAX_MATCHES]
+    times = [(m.start(), m.end(), int(m.group(1)), int(m.group(2)))
+             for m in islice(TIME.finditer(text), MAX_MATCHES)]
+    starts = [t[0] for t in times]
     for i, x in enumerate(out):
         lo = out[i - 1].end if i else 0
         hi = out[i + 1].start if i + 1 < len(out) else len(text)
-        after = [t for t in times if x.end <= t[0] < min(hi, x.end + 20) and TIME_AFTER.match(text[x.end:t[0]])]
-        before = [t for t in times if max(lo, x.start - 30) <= t[0] and t[1] <= x.start
-                  and TIME_BEFORE.match(text[t[1]:x.start])]
+        # only the times within 30 characters of the date (bisect over the sorted time positions)
+        near = times[bisect_left(starts, max(lo, x.start - 30)):bisect_left(starts, min(hi, x.end + 20))]
+        after = [t for t in near if x.end <= t[0] and TIME_AFTER.match(text[x.end:t[0]])]
+        before = [t for t in near if t[1] <= x.start and TIME_BEFORE.match(text[t[1]:x.start])]
         t = before[-1] if before else after[0] if after else None
         if t:
             x.time = (t[2], t[3])
@@ -366,7 +376,7 @@ def find_dates(text: str) -> list[_Date]:
 
 def _year_less_dates(text: str, years: set[int]) -> list[date]:
     out = []
-    for m in DATE_NO_YEAR.finditer(text):
+    for m in islice(DATE_NO_YEAR.finditer(text), MAX_MATCHES):
         for y in sorted(years):
             d = _make_date(y, MONTHS[m.group(2).lower()], int(m.group(1)))
             if d:
@@ -388,7 +398,7 @@ def _holidays(texts: Sequence[str], years: set[int]) -> set[date]:
 
 
 def _today(text: str, dates: list[_Date]) -> _Date | None:
-    for m in TODAY.finditer(text):
+    for m in islice(TODAY.finditer(text), MAX_MATCHES):
         for x in dates:
             if m.end() <= x.start <= m.end() + 40 and "\n" not in text[m.end():x.start]:
                 return x
@@ -398,7 +408,7 @@ def _today(text: str, dates: list[_Date]) -> _Date | None:
 def _durations(texts: Sequence[str]) -> list[tuple[int, str]]:
     out = []
     for text in texts:
-        for m in DURATION.finditer(text):
+        for m in islice(DURATION.finditer(text), MAX_MATCHES):
             unit = next(u for u, _ in _DUR_UNITS if m.group(u))
             n = int(m.group(1))
             if n == 0 or PAST.match(text[m.end():]) or text[max(0, m.start() - 4):m.start()].lower() == "vor ":
@@ -407,7 +417,7 @@ def _durations(texts: Sequence[str]) -> list[tuple[int, str]]:
                 continue
             if (n, unit) not in out:
                 out.append((n, unit))
-        for m in ORDINAL_DAY.finditer(text):
+        for m in islice(ORDINAL_DAY.finditer(text), MAX_MATCHES):
             n = int(m.group(1))
             work = bool(m.group(2)) or bool(re.search(r"robocz|werk|arbeit|virke|working|business", m.group(0), re.I))
             unit = "wd" if work else "d"
@@ -472,20 +482,28 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
     """Numbers with a unit (currency, %, data size, weight, length, hours, ...), in order of appearance. A range
     "24,95-25,05 mm" gives two amounts. Spans in `masked` (dates) are skipped."""
     out = []
+    masked = sorted(masked)
+    mstarts = [x for x, _ in masked]
+
+    def overlaps(spans, starts, a, b):
+        """Whether [a, b) overlaps one of the sorted, non-overlapping spans."""
+        i = bisect_left(starts, b)
+        return i > 0 and spans[i - 1][1] > a
 
     def free(a, b):
-        return not any(a < y and x < b for x, y in masked)
+        return not overlaps(masked, mstarts, a, b)
 
-    for m in AMOUNT_PREFIX.finditer(text):
+    for m in islice(AMOUNT_PREFIX.finditer(text), MAX_MATCHES):
         if not free(m.start(), m.end()):
             continue
         v = _number(m.group(2), lang)
         if v is not None:
             sym = m.group(1)
             out.append(_Amount(m.start(), m.end(), v, _CUR_PREFIX[sym.lower()], _places(m.group(2), lang), True, sym))
-    taken = [(a.start, a.end) for a in out]
-    for m in AMOUNT_SUFFIX.finditer(text):
-        if not free(m.start(), m.end()) or any(m.start() < y and x < m.end() for x, y in taken):
+    taken = sorted((a.start, a.end) for a in out)
+    tstarts = [x for x, _ in taken]
+    for m in islice(AMOUNT_SUFFIX.finditer(text), MAX_MATCHES):
+        if not free(m.start(), m.end()) or overlaps(taken, tstarts, m.start(), m.end()):
             continue
         unit = next(u for g, u in _SUFFIX_GROUPS if m.group(g))
         sym = next(m.group(g) for g, u in _SUFFIX_GROUPS if m.group(g))
@@ -504,7 +522,7 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
                     continue
                 out.append(_Amount(start, m.end(), v, unit, _places(raw, lang), False, sym, ranged))
     out.sort(key=lambda a: a.start)
-    return out
+    return out[:MAX_MATCHES]
 
 
 def _render_amount(a_value: Decimal, like: _Amount, lang: str, places: int | None = None) -> str:
@@ -530,11 +548,12 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     """The facts for a state and the instructions of its questions, as (lines, language). Empty lines when there is
     nothing to compute. Dates and amounts come from the state; durations, thresholds and named days off also from the
     instructions."""
-    lang = language or detect_language(state + "\n" + "\n".join(instructions))
+    state = state[:MAX_INPUT_CHARS]
+    rule = "\n".join(instructions)[:MAX_INPUT_CHARS]
+    lang = language or detect_language(state + "\n" + rule)
     if lang not in LANGUAGES:
         lang = "en"
     t, wd = T[lang], WEEKDAYS[lang]
-    rule = "\n".join(instructions)
     lines: list[str] = []
 
     # --- dates
@@ -620,7 +639,7 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     # --- month ranges ("09.2019 - 08.2021", "03.2020 - obecnie")
     ref = today.day if today is not None else None
     ranges = []
-    for m in MONTH_RANGE.finditer(state):
+    for m in islice(MONTH_RANGE.finditer(state), MAX_MATCHES):
         a = (int(m.group(2)), int(m.group(1)))
         if m.group(3):
             b = (int(m.group(4)), int(m.group(3)))
@@ -708,6 +727,7 @@ def _sums(state: str, amounts: list[_Amount], lang: str, sentences: bool = True)
     for raw in state.split("\n"):
         lines.append((pos, pos + len(raw), raw))
         pos += len(raw) + 1
+    starts = [x.start for x in amounts]  # amounts are sorted by position
     blocks, cur = [], []
     for a, b, raw in lines:
         if LIST_LINE.match(raw):
@@ -721,7 +741,7 @@ def _sums(state: str, amounts: list[_Amount], lang: str, sentences: bool = True)
     for block in blocks:
         by_unit: dict[str, list[tuple[_Amount, str]]] = {}
         for a, b, raw in block:
-            here = [x for x in amounts if a <= x.start < b]
+            here = amounts[bisect_left(starts, a):bisect_left(starts, b)]
             if len(here) == 1:  # one amount per line: a list of amounts
                 by_unit.setdefault(here[0].unit, []).append((here[0], _strip_numbers(raw)))
         for unit, items in by_unit.items():

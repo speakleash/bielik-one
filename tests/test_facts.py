@@ -293,3 +293,48 @@ def test_facts_on_a_json_state_and_without_facts():
 def test_facts_flag_is_validated():
     with pytest.raises(Exception):
         request(facts="sometimes")
+
+
+# ------------------------------------------------------------------ untrusted input
+
+
+@pytest.mark.parametrize(
+    "state, rule",
+    [
+        ("a.a." * 25_000, "Does the text contain an e-mail address?"),  # no "@": the e-mail pattern must not backtrack
+        ("x" * 50_000 + "@" + "a." * 25_000, "Podaj adres e-mail."),
+        (" ".join(f"{i % 1000:03d}" for i in range(30_000)) + " zł", "Limit 500 zł, suma łącznie."),
+        ("\n".join(f"- 2026-01-{i % 28 + 1:02d} 10:{i % 60:02d} item {i} £{i},000" for i in range(5_000)),
+         "Today: report if the total is more than £10,000 within 30 working days."),
+        ("Today is 1 March 2027. " + "12:00 1 March 2027 " * 5_000, "Within 14 days after today."),
+        ("Dziś 2026-01-01. " + "01.1900 - obecnie; " * 5_000, "Co najmniej 3 lata, na osobę, 4 osoby."),
+    ],
+)
+def test_large_adversarial_inputs_finish_fast(state, rule):
+    import time
+
+    start = time.perf_counter()
+    lines, _ = facts(state, [rule])
+    assert time.perf_counter() - start < 1.0
+    assert len(lines) <= 40
+
+
+def test_far_apart_dates_are_counted_without_a_day_by_day_loop():
+    lines = lines_of("Od 1900-01-01 do 2200-12-31.", "Ile dni roboczych upłynęło?")
+    assert any(x.startswith("Od 1900-01-01 do 2200-12-31: 109937 dni") and "włącznie: 78527;" in x for x in lines)
+
+
+def test_working_day_count_matches_a_day_by_day_count():
+    import random
+    from datetime import timedelta
+
+    from bielik_one.prompting.facts import _workdays_between
+
+    rng = random.Random(0)
+    for _ in range(300):
+        a = date(2026, 1, 1) + timedelta(days=rng.randrange(400))
+        b = a + timedelta(days=rng.randrange(60))
+        holidays = {a + timedelta(days=rng.randrange(-5, 70)) for _ in range(3)}
+        slow = sum((a + timedelta(days=i)).weekday() < 5 and a + timedelta(days=i) not in holidays
+                   for i in range(1, (b - a).days + 1))
+        assert _workdays_between(a, b, holidays) == slow
