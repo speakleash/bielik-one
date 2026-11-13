@@ -106,6 +106,18 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
             return StreamingResponse(chunks(), media_type="text/event-stream")
         return {"received": body}
 
+    @app.post("/adapters")
+    @app.delete("/adapters/{name}")
+    async def adapters():
+        return {"ok": True}
+
+    @app.post("/invocations")
+    async def invocations(request: Request):
+        # vLLM's SageMaker route copies the adapter header into the model after any body filter.
+        body = await request.json()
+        body["model"] = request.headers.get("x-amzn-sagemaker-adapter-identifier", body.get("model"))
+        return {"received": body}
+
     @app.post("/upload")
     async def upload(request: Request):
         return {"bytes": len(await request.body())}
@@ -370,18 +382,27 @@ def test_non_json_content_type_is_still_filtered():
         assert response.status_code == 200 and "vllm_xargs" not in response.json()["received"]
 
 
-def test_runtime_lora_updates_cannot_touch_the_decision_adapter(tmp_path):
-    (tmp_path / "adapter").mkdir()
-    app, _, _, _ = make_app(package=tmp_path.resolve())
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/v1/load_lora_adapter", {"lora_name": "copy", "lora_path": "/pkg/adapter"}),
+    ("POST", "/v1/unload_lora_adapter", {"lora_name": "decision"}),
+    ("POST", "/adapters", {"name": "copy", "src": "/pkg/adapter"}),
+    ("DELETE", "/adapters/decision", None),
+])
+def test_runtime_lora_management_is_internal_only(method, path, body):
+    app, owner, _, _ = make_app()
     with TestClient(app) as client:
-        assert client.post("/v1/unload_lora_adapter", json={"lora_name": "decision"}).status_code == 400
-        assert client.post("/v1/load_lora_adapter", json={"lora_name": "decision", "lora_path": "/x"}).status_code == 400
-        for path in (tmp_path / "adapter", tmp_path):
-            response = client.post("/v1/load_lora_adapter", json={"lora_name": "copy", "lora_path": str(path)})
-            assert response.status_code == 400
-        other = {"lora_name": "other", "lora_path": str(tmp_path.parent / "other-adapter")}
-        assert client.post("/v1/load_lora_adapter", json=other).status_code == 200
-        assert client.post("/v1/unload_lora_adapter", json={"lora_name": "other"}).status_code == 200
+        assert client.request(method, path, json=body).status_code == 403
+        internal = {"x-systemone-internal": owner.settings.internal_token}
+        assert client.request(method, path, json=body, headers=internal).status_code == 200
+
+
+@pytest.mark.parametrize("header", ["X-Amzn-SageMaker-Adapter-Identifier", "X-Amzn-SageMaker-Adapter-Alias"])
+def test_sagemaker_adapter_headers_cannot_select_the_adapter(header):
+    app, _, _, _ = make_app()
+    with TestClient(app) as client:
+        response = client.post("/invocations", json={"model": "base-a"}, headers={header: "decision"})
+        assert response.status_code == 400
+        assert client.post("/invocations", json={"model": "base-a"}).json()["received"]["model"] == "base-a"
 
 
 def test_tls_request_without_self_url_explains_the_setting():

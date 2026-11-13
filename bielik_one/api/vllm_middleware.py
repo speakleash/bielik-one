@@ -17,9 +17,10 @@ argument); the middleware reads it from /v1/models on the first decision request
 - GET /v1/models: the decision adapter's LoRA name is left out.
 
 The adapter's LoRA name is internal. Client requests that name it are refused (400), `vllm_xargs` is removed from
-client requests and prompt logprobs are refused, as in `bielik-one frontend`. With runtime LoRA updating enabled,
-clients cannot unload the decision adapter or load the package's adapter under another name. Only this middleware's
-own loopback reads, which carry a per-process secret header, use the adapter.
+client requests and prompt logprobs are refused, as in `bielik-one frontend`. SageMaker adapter headers and the
+runtime LoRA management routes (VLLM_ALLOW_RUNTIME_LORA_UPDATING) are refused for clients (403), so the decision
+adapter can be neither selected, unloaded nor loaded again under another name. Only this middleware's own loopback
+reads, which carry a per-process secret header, use the adapter.
 
 Environment:
 - SYSTEMONE_PACKAGE (required): the adapter package directory; its checksums are verified at startup.
@@ -33,8 +34,8 @@ Environment:
   --max-num-seqs profile).
 - SYSTEMONE_MAX_BODY_MB: largest decision or public request body (default 16); form uploads are not limited here.
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
-  --api-server-count > 1 a loopback read can reach another API process, so a shared value is required then
-  (the server refuses to start without it).
+  --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API
+  process, so a shared value is required then (the server refuses to start without it).
 - Authentication and CORS: decisions pass through vLLM's own middleware, including API keys from its CLI or
   configuration file. Loopback reads use a configured server key (VLLM_API_KEY is the fallback).
 
@@ -60,7 +61,11 @@ DECISION_PATH = "/v1/systemone"
 MODELS_PATH = "/v1/models"
 DEFAULT_LORA_NAME = "decision"
 INTERNAL_HEADER = "x-systemone-internal"
-LORA_UPDATE_PATHS = ("/v1/load_lora_adapter", "/v1/unload_lora_adapter")
+# Runtime LoRA management (VLLM_ALLOW_RUNTIME_LORA_UPDATING), OpenAI-style and SageMaker-style: a client could unload
+# the decision adapter or load it again under a public name, so these routes are internal-only.
+LORA_ADMIN_PATHS = ("/v1/load_lora_adapter", "/v1/unload_lora_adapter", "/adapters")
+# SageMaker routes (/invocations) copy these headers into the request's model after our body filter has run.
+ADAPTER_HEADERS = (b"x-amzn-sagemaker-adapter-identifier", b"x-amzn-sagemaker-adapter-alias")
 FORM_MEDIA = ("multipart/form-data", "application/x-www-form-urlencoded")
 BIND_RETRY_SECONDS = 5.0  # a failed setup check is answered from memory this long, instead of re-probing per request
 
@@ -147,7 +152,9 @@ def build_engine(settings: Settings):
         )
     finally:
         # launch.frontend writes adapter metadata to a fresh temporary directory; everything needed is read now.
-        shutil.rmtree(metadata_path.parent, ignore_errors=True)
+        tmp = metadata_path.parent
+        if tmp.name.startswith("bielik-one-") and tmp != root and root not in tmp.parents:
+            shutil.rmtree(tmp, ignore_errors=True)
     if settings.workers is None:
         settings.workers = int(argv[argv.index("--workers") + 1])
     if metadata.get("base_row_types"):
@@ -240,12 +247,6 @@ def _router(app):
     raise RuntimeError("SystemOne middleware requires vLLM's FastAPI router")
 
 
-def _route_path(scope) -> str:
-    path = scope.get("path", "")
-    root = scope.get("root_path", "")
-    return path[len(root):] if root and path.startswith(root) else path
-
-
 class _DecisionEndpoint:
     def __init__(self, owner):
         self.owner = owner
@@ -271,12 +272,32 @@ class _PublicRoute:
         return await self.owner._guarded_post(scope, receive, send, next_app=self.app)
 
     async def __call__(self, scope, receive, send):
+        from bielik_one.api.errors import INVALID_REQUEST, error_bytes
+
         headers = scope.get("headers", [])
         if scope.get("method") == "POST" and not self.owner._is_internal(headers):
+            if any(key.lower() in ADAPTER_HEADERS for key, _ in headers):
+                message = "SageMaker adapter headers are not accepted; use /v1/systemone for decisions"
+                return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, message, fmt="openai"))
             media = (_header(headers, b"content-type") or "").split(";", 1)[0].strip().lower()
             if media not in FORM_MEDIA:
                 return await self.guarded(scope, receive, send)
         return await self.app(scope, receive, send)
+
+
+class _InternalOnlyRoute:
+    """Routes clients must not use (runtime LoRA management): 403 unless the request is a loopback read."""
+
+    def __init__(self, app, owner):
+        self.app, self.owner = app, owner
+
+    async def __call__(self, scope, receive, send):
+        from bielik_one.api.errors import INVALID_REQUEST, error_bytes
+
+        if self.owner._is_internal(scope.get("headers", [])):
+            return await self.app(scope, receive, send)
+        message = "runtime LoRA management is disabled while the SystemOne decision adapter is served"
+        return await _send_json(send, 403, error_bytes(403, INVALID_REQUEST, message, fmt="openai"))
 
 
 class _ModelListRoute:
@@ -325,7 +346,9 @@ class SystemOneMiddleware:
         for route in router.routes:
             path = getattr(route, "path", None)
             methods = getattr(route, "methods", None) or set()
-            if path == MODELS_PATH and "GET" in methods:
+            if path and any(path == p or path.startswith(p + "/") for p in LORA_ADMIN_PATHS):
+                route.app = _InternalOnlyRoute(route.app, self)
+            elif path == MODELS_PATH and "GET" in methods:
                 route.app = _ModelListRoute(route.app, self)
             elif "POST" in methods:
                 route.app = _PublicRoute(route.app, self)
@@ -492,28 +515,6 @@ class SystemOneMiddleware:
 
     # -- the vLLM routes -----------------------------------------------------------------------------------------
 
-    def _lora_update_problem(self, path: str, raw: bytes) -> str | None:
-        """Runtime LoRA updates (VLLM_ALLOW_RUNTIME_LORA_UPDATING) must not unload or re-expose the decision adapter."""
-        if path not in LORA_UPDATE_PATHS:
-            return None
-        try:
-            body = json.loads(raw)
-        except ValueError:
-            return None  # vLLM rejects it
-        if not isinstance(body, dict):
-            return None
-        if body.get("lora_name") == self.settings.lora_name:
-            return f"LoRA adapter {self.settings.lora_name!r} is internal to /v1/systemone"
-        lora_path, package = body.get("lora_path"), self.settings.package
-        if path == LORA_UPDATE_PATHS[0] and isinstance(lora_path, str) and package is not None:
-            try:
-                target = Path(lora_path).expanduser().resolve()
-            except (OSError, RuntimeError, ValueError):
-                return None
-            if target == package or package in target.parents:
-                return "the decision package's adapter answers typed decisions at /v1/systemone only"
-        return None
-
     async def _guarded_post(self, scope, receive, send, *, next_app):
         """Client requests: the LoRA name, vllm_xargs and prompt logprobs are refused or removed."""
         from bielik_one.api.errors import INVALID_REQUEST, error_bytes
@@ -523,9 +524,6 @@ class SystemOneMiddleware:
         raw = await _read_body(receive)
         if raw is None:
             return
-        problem = self._lora_update_problem(_route_path(scope), raw)
-        if problem:
-            return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, problem, fmt="openai"))
         try:
             # A request without a model keeps none: vLLM answers it with its default served name, as without us.
             body = public_request_body(raw, {self.settings.lora_name}, None)
