@@ -469,25 +469,8 @@ def public_request_body(
     return json.dumps(body).encode() if changed else raw
 
 
-def build_remote_app(
-    engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default"
-):
-    from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from starlette.background import BackgroundTask
-
-    app = build_app(engine, error_format)
-    app.title = "SystemOne — choice, noul, score, labels"
-    # Keep our typed /v1/systemone; forward the ordinary OpenAI API unchanged.
-    app.router.routes[:] = [
-        r
-        for r in app.router.routes
-        if getattr(r, "path", None) not in {"/v1/models", "/health", "/ping"}
-    ]
-    # Loopback backend: ignore HTTP_PROXY. Non-streaming chat sends nothing until the generation ends,
-    # so the read timeout is long; connecting fails fast.
-    proxy = httpx.AsyncClient(
-        timeout=httpx.Timeout(180, connect=10, read=3600), trust_env=False
-    )
+def install_backend_errors(app, error_format: str = "default"):
+    """Answer failed backend reads and reasoning calls of a decision app with typed 502/504/422 errors."""
 
     def failure(request, status, code, message):
         return error_response(status, code, message, path=request.url.path, fmt=error_format)
@@ -507,6 +490,30 @@ def build_remote_app(
         if isinstance(exc.__cause__, httpx.TimeoutException):
             return failure(request, 504, TIMEOUT, "vLLM did not answer in time")
         return failure(request, 502, BACKEND_UNAVAILABLE, str(exc))
+
+    return failure
+
+
+def build_remote_app(
+    engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default"
+):
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
+    from starlette.background import BackgroundTask
+
+    app = build_app(engine, error_format)
+    app.title = "SystemOne — choice, noul, score, labels"
+    # Keep our typed /v1/systemone; forward the ordinary OpenAI API unchanged.
+    app.router.routes[:] = [
+        r
+        for r in app.router.routes
+        if getattr(r, "path", None) not in {"/v1/models", "/health", "/ping"}
+    ]
+    # Loopback backend: ignore HTTP_PROXY. Non-streaming chat sends nothing until the generation ends,
+    # so the read timeout is long; connecting fails fast.
+    proxy = httpx.AsyncClient(
+        timeout=httpx.Timeout(180, connect=10, read=3600), trust_env=False
+    )
+    failure = install_backend_errors(app, error_format)
 
     @app.get("/health")
     @app.get("/ping")
