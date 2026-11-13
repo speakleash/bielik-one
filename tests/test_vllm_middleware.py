@@ -65,7 +65,7 @@ class ServerAuth:
 
 
 def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_startup=False, engine=None,
-             server_count=None, **settings):
+             server_count=None, native_route=False, **settings):
     engine = engine if engine is not None else Engine()
     startup = []
 
@@ -95,6 +95,7 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
     @app.post("/v1/completions")
     @app.post("/v1/responses")
     @app.post("/v1/messages")
+    @app.post("/inference/v1/generate")
     @app.post("/v1/load_lora_adapter")
     @app.post("/v1/unload_lora_adapter")
     async def generate(request: Request):
@@ -121,6 +122,13 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
     @app.post("/upload")
     async def upload(request: Request):
         return {"bytes": len(await request.body())}
+
+    if native_route:
+        async def create_structured_decision():
+            return JSONResponse({"error": "The model does not support the structured decision API"}, 501)
+
+        create_structured_decision.__module__ = "vllm.entrypoints.generate.structured_decisions.api_router"
+        app.add_api_route("/v1/systemone", create_structured_decision, methods=["POST"])
 
     app.add_middleware(CORSMiddleware, allow_origins=["https://client.example"],
                        allow_methods=["POST"], allow_headers=["Authorization", "Content-Type"])
@@ -513,3 +521,50 @@ def test_self_ca_verifies_loopback_reads(tmp_path):
     reasoner = engine.reasoners["original"]
     assert reasoner.tls_opener is not None
     assert reasoning.EndpointReasoner("http://x/v1", "m").tls_opener is None
+
+
+def test_rebuilt_middleware_stack_reuses_the_first_instance():
+    """vLLM 0.32's SageMaker bootstrap builds the middleware stack before Starlette builds it again."""
+    app, owner, engine, _ = make_app(keys=["key"])
+    app.middleware_stack = app.build_middleware_stack()  # a second SystemOneMiddleware over the same router
+    second = app.middleware_stack
+    while not isinstance(second, middleware.SystemOneMiddleware):
+        second = second.app
+    assert second is not owner and second.owner is owner
+    assert [getattr(r, "path", None) for r in app.router.routes].count("/v1/systemone") == 1
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer key"}
+        assert client.post("/v1/systemone", json=decision(), headers=headers).status_code == 200
+        assert client.get("/v1/systemone/health", headers=headers).status_code == 200
+        assert client.post("/v1/chat/completions", json={"model": "decision"}, headers=headers).status_code == 400
+    assert engine.client.headers["Authorization"] == "Bearer key" and engine.closed == 1
+
+
+def test_loopback_reads_verify_with_the_system_store_by_default():
+    import ssl
+
+    context = middleware.Settings().verify()
+    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+
+
+def test_vllm_builtin_structured_decisions_route_is_replaced():
+    """vLLM 0.32 always registers its own POST /v1/systemone, disabled (501) for SystemOne architectures."""
+    app, _, engine, _ = make_app(native_route=True)
+    assert [getattr(r, "path", None) for r in app.router.routes].count("/v1/systemone") == 1
+    with TestClient(app) as client:
+        response = client.post("/v1/systemone", json=decision())
+        assert response.status_code == 200 and response.json()["answers"]["q"]["type"] == "choice"
+    assert len(engine.requests) == 1
+
+
+def test_token_in_requests_cannot_set_backend_flags():
+    app, _, _, _ = make_app()
+    with TestClient(app) as client:
+        body = {"model": "base-a", "token_ids": [1, 2],
+                "sampling_params": {"max_tokens": 1, "extra_args": {"systemone_head": "base"}}}
+        received = client.post("/inference/v1/generate", json=body).json()["received"]
+        assert received["sampling_params"] == {"max_tokens": 1}
+        body["sampling_params"] = {"prompt_logprobs": 1}
+        assert client.post("/inference/v1/generate", json=body).status_code == 400
+        body = {"model": "decision", "token_ids": [1]}
+        assert client.post("/inference/v1/generate", json=body).status_code == 400

@@ -18,8 +18,12 @@ argument); the middleware reads it from /v1/models on the first decision request
 - /v1/chat/completions, /v1/completions and the other vLLM routes: the unchanged base model;
 - GET /v1/models: the decision adapter's LoRA name is left out.
 
+vLLM >= 0.32 registers its own POST /v1/systemone (generic structured decisions for a few stock architectures,
+disabled with 501 for the SystemOne architectures of adapter packages); the middleware replaces that route only.
+
 The adapter's LoRA name is internal. Client requests that name it are refused (400), `vllm_xargs` is removed from
-client requests and prompt logprobs are refused, as in `bielik-one frontend`. SageMaker adapter headers and the
+client requests (and `extra_args` from token-in `sampling_params`) and prompt logprobs are refused, as in
+`bielik-one frontend`. SageMaker adapter headers and the
 runtime LoRA management routes (VLLM_ALLOW_RUNTIME_LORA_UPDATING) are refused for clients (403), so the decision
 adapter can be neither selected, unloaded nor loaded again under another name. Only this middleware's own loopback
 reads, which carry a per-process secret header, use the adapter.
@@ -32,7 +36,7 @@ Environment:
 - SYSTEMONE_SELF_URL: how this process reaches its own vLLM routes (default: the address the first decision request
   arrived on, with http://; required for --uds or TLS, e.g. https://<name in the certificate>:8000).
 - SYSTEMONE_SELF_CA: a CA bundle (PEM) that verifies the TLS certificate of SYSTEMONE_SELF_URL, when it is not
-  signed by a system-trusted CA (proxy and SSL_CERT_FILE variables are ignored for loopback reads).
+  signed by a CA in the system trust store (proxy variables are ignored for loopback reads).
 - SYSTEMONE_NO_CALIBRATION=1: raw temperature-1 probabilities instead of the package's calibration.json.
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
@@ -135,10 +139,15 @@ class Settings:
         return settings
 
     def ssl_context(self) -> ssl.SSLContext | None:
-        """The verification context of the loopback reads: the system trust store, or SYSTEMONE_SELF_CA."""
+        """SYSTEMONE_SELF_CA's verification context; None means the system trust store (see `verify`)."""
         if self.self_ca is None:
             return None
         return ssl.create_default_context(cafile=str(Path(self.self_ca).expanduser()))
+
+    def verify(self) -> ssl.SSLContext:
+        """httpx verification of loopback reads: SYSTEMONE_SELF_CA, else the system trust store (as urllib uses),
+        not httpx's bundled certifi list, so a CA installed on the host verifies as it does for the reasoning pass."""
+        return self.ssl_context() or ssl.create_default_context()
 
 
 def build_engine(settings: Settings):
@@ -184,7 +193,7 @@ def build_engine(settings: Settings):
         timeout=180,
         trust_env=False,  # loopback: ignore HTTP_PROXY
         headers=headers,
-        verify=settings.ssl_context() or True,
+        verify=settings.verify(),
         limits=httpx.Limits(max_connections=settings.workers, max_keepalive_connections=settings.workers),
     )
     try:
@@ -263,6 +272,33 @@ def _router(app):
             return app
         app = getattr(app, "app", None)
     raise RuntimeError("SystemOne middleware requires vLLM's FastAPI router")
+
+
+def _vllm_structured_decisions(route) -> bool:
+    """vLLM's built-in /v1/systemone (>= 0.32: generic structured decisions for a few stock architectures). It is
+    disabled (501) for the SystemOne architectures of adapter packages, so the middleware's route replaces it."""
+    module = getattr(getattr(route, "endpoint", None), "__module__", None) or ""
+    return module.startswith("vllm.entrypoints.generate.structured_decisions")
+
+
+def _scrub_sampling_params(raw: bytes) -> bytes:
+    """Token-in requests (/inference/v1/generate) carry full SamplingParams: `extra_args` would reach the decision-head
+    logits processor like vllm_xargs, and prompt logprobs are not supported by it."""
+    from bielik_one.api.server import RequestError
+
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return raw
+    params = body.get("sampling_params") if isinstance(body, dict) else None
+    if not isinstance(params, dict):
+        return raw
+    if params.get("prompt_logprobs") is not None:
+        raise RequestError(["sampling_params", "prompt_logprobs"], "prompt logprobs are not supported by this server")
+    if "extra_args" not in params:
+        return raw
+    params.pop("extra_args")
+    return json.dumps(body).encode()
 
 
 class _DecisionEndpoint:
@@ -346,8 +382,15 @@ class SystemOneMiddleware:
 
         self.app = app
         router = _router(app)
+        existing = getattr(router, "_systemone_owner", None)
+        if existing is not None:
+            # Starlette may build the middleware stack more than once (vLLM's SageMaker bootstrap does so before
+            # serving): the routes, engine and state of the first instance stay in charge.
+            self.owner = existing
+            return
+        self.owner = self
         for path in (DECISION_PATH, HEALTH_PATH):
-            if any(getattr(route, "path", None) == path for route in router.routes):
+            if any(getattr(r, "path", None) == path and not _vllm_structured_decisions(r) for r in router.routes):
                 raise RuntimeError(f"vLLM already defines {path}; refusing to shadow it")
         self.settings = settings or Settings.from_env()
         self.engine = engine if engine is not None else build_engine(self.settings)
@@ -360,17 +403,23 @@ class SystemOneMiddleware:
         self._bind_lock = asyncio.Lock()
         self._bind_failure: tuple[float, int, bytes] | None = None  # (monotonic time, status, error body)
         self._ssl = self.settings.ssl_context()
+        self._verify = self.settings.verify()
         self._internal = self.settings.internal_token.encode()
         self._api_key = self.settings.api_key
         self._credentials_configured = False
         self.check_transport = None  # tests: an httpx transport for the startup self-check
         self._install_routes(router)
+        router._systemone_owner = self
 
     def _install_routes(self, router):
         from starlette.routing import Route
 
         # A real route receives the same authentication, CORS, scaling and request-id
         # middleware as every other vLLM endpoint, including preflight requests.
+        native = [r for r in router.routes if getattr(r, "path", None) == DECISION_PATH]
+        if native:
+            router.routes[:] = [r for r in router.routes if r not in native]
+            log.info("SystemOne middleware: replacing vLLM's built-in %s (structured decisions)", DECISION_PATH)
         for route in router.routes:
             path = getattr(route, "path", None)
             methods = getattr(route, "methods", None) or set()
@@ -422,7 +471,7 @@ class SystemOneMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            self._configure_credentials(scope)
+            self.owner._configure_credentials(scope)
         return await self.app(scope, receive, send)
 
     def _is_internal(self, headers) -> bool:
@@ -530,7 +579,7 @@ class SystemOneMiddleware:
             headers["Authorization"] = f"Bearer {self._api_key}"
         try:
             async with httpx.AsyncClient(
-                timeout=10, trust_env=False, verify=self._ssl or True, transport=self.check_transport
+                timeout=10, trust_env=False, verify=self._verify, transport=self.check_transport
             ) as client:
                 response = await client.get(url + MODELS_PATH, headers=headers)
                 response.raise_for_status()
@@ -589,7 +638,7 @@ class SystemOneMiddleware:
             return
         try:
             # A request without a model keeps none: vLLM answers it with its default served name, as without us.
-            body = public_request_body(raw, {self.settings.lora_name}, None)
+            body = public_request_body(_scrub_sampling_params(raw), {self.settings.lora_name}, None)
         except RequestError as exc:
             return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, exc.msg, fmt="openai"))
         replayed = False
