@@ -33,6 +33,7 @@ from bielik_one.prompting.schema import (
 )
 
 KINDS = ("choice", "noul", "score")
+DEFAULT_READ_TWICE_MAX_INPUT_TOKENS = 4096
 MAX_PERMUTATIONS = 16
 MAX_QUESTIONS = 64
 MAX_STATE_CHARS = 400_000  # well above a 32768-token context; longer prompts are rejected by the backend anyway
@@ -102,7 +103,11 @@ class SystemOneIn(BaseModel):
     seed: int | None = None
     temperature: float | dict[str, float] | None = None
     questions_before_state: bool = False
-    read_twice: bool = False
+    read_twice: bool = True
+    read_twice_max_input_tokens: int | None = Field(
+        default=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS, ge=0, strict=True
+    )
+    prompt_details: bool = False
     reasoning: Literal["off", "on", "auto"] = "off"
     reasoning_model: Literal["original"] = "original"
     reasoning_threshold: float = Field(default=0.9, ge=0, le=1, allow_inf_nan=False)
@@ -549,6 +554,7 @@ class LetterEngine:
         seed = 0 if body.seed is None else body.seed
         prepared = []
         prompts: list[Row] = []
+        first_rows: list[Row] = []
         reads = 0
         per_option_chars = 0
         for name, question in body.questions.items():
@@ -583,6 +589,7 @@ class LetterEngine:
                     orders = option_orders(2, body.permutations, seed)
                     parts.append((key, sub_row, orders))
                     prompts.extend(_reordered(sub_row, perm) for perm in orders)
+                    first_rows.extend(sub_row for _ in orders)
                 prepared.append((name, row, legend, parts))
                 continue
             if len(row.options) > self.capacity:
@@ -593,13 +600,16 @@ class LetterEngine:
             orders = option_orders(len(row.options), body.permutations, seed)
             prepared.append((name, row, legend, orders))
             prompts.extend(_reordered(row, perm) for perm in orders)
+            first_rows.extend(row for _ in orders)
         assert len(prompts) == reads
         if body.questions_before_state or body.read_twice or analyses:
             tables, input_tokens = self.distributions(
                 prompts,
+                first_rows=first_rows,
                 questions=questions or [item[1] for item in prepared],
                 questions_before_state=body.questions_before_state,
                 read_twice=body.read_twice,
+                read_twice_max_input_tokens=body.read_twice_max_input_tokens,
                 analyses=analyses,
             )
         else:

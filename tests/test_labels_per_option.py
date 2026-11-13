@@ -196,7 +196,7 @@ def test_long_per_option_expansion_is_rejected_before_reading():
 def test_remote_engine_usage_counts_one_read_per_option(monkeypatch):
     from bielik_one.api.remote_vllm import RemoteVllmEngine
 
-    monkeypatch.setattr(LetterEngine, "_evaluate_once", lambda self, body, **kw: {"usage": {"input_tokens": 0, "output_tokens": -1}})
+    monkeypatch.setattr(LetterEngine, "_evaluate_once", lambda self, body, **kw: {"answers": {}, "usage": {"input_tokens": 0, "output_tokens": -1}})
     engine = RemoteVllmEngine.__new__(RemoteVllmEngine)
     engine.base_row_types = frozenset()
     for perms, expected in ((1, 3), (2, 6), (16, 6)):
