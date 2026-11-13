@@ -53,6 +53,8 @@ MAX_CALENDAR = 14  # all date lines together (dates, gaps, clock time, date + du
 # most MAX_MATCHES dates, times and amounts, so the work per request stays small and linear.
 MAX_INPUT_CHARS = 20_000
 MAX_MATCHES = 300
+# Days off: at most this many, for year-less dates ("1 May") at most MAX_YEARS years (those of the dates of the text).
+MAX_HOLIDAYS, MAX_YEARS = 50, 3
 
 # ------------------------------------------------------------------ words per language
 
@@ -289,7 +291,8 @@ def _workdays_between(a: date, b: date, holidays: set[date]) -> int:
         return 0
     weeks, rest = divmod(days, 7)
     n = 5 * weeks + sum((a.weekday() + i) % 7 < 5 for i in range(1, rest + 1))
-    return n - sum(1 for h in holidays if a < h <= b and h.weekday() < 5)
+    weekdays = sorted(h for h in holidays if h.weekday() < 5)  # at most MAX_HOLIDAYS
+    return n - (bisect_right(weekdays, b) - bisect_right(weekdays, a))
 
 
 def _plus_workdays(a: date, k: int, holidays: set[date]) -> date:
@@ -379,27 +382,30 @@ def find_dates(text: str) -> list[_Date]:
     return out
 
 
-def _year_less_dates(text: str, years: set[int]) -> list[date]:
-    out = []
-    for m in islice(DATE_NO_YEAR.finditer(text), MAX_MATCHES):
-        for y in sorted(years):
-            d = _make_date(y, MONTHS[m.group(2).lower()], int(m.group(1)))
-            if d:
-                out.append(d)
-    return out
-
-
-def _holidays(texts: Sequence[str], years: set[int]) -> set[date]:
-    """Dates the text names as days off: dates in a sentence that speaks of a holiday / day off."""
-    out = set()
+def _holidays(texts: Sequence[str], years: Sequence[int]) -> set[date]:
+    """Dates the text names as days off: dates in a sentence that speaks of a holiday / day off. One budget of
+    MAX_MATCHES dates for all sentences, at most MAX_HOLIDAYS days off; a year-less date ("1 May") is taken in each of
+    `years`."""
+    out: dict[date, None] = {}  # ordered, without duplicates
+    budget = MAX_MATCHES
     for text in texts:
         bounds = [0] + [b + 1 for b in _sentence_bounds(text)] + [len(text)]
         for a, b in zip(bounds, bounds[1:]):
+            if budget <= 0 or len(out) >= MAX_HOLIDAYS:
+                break
             s = text[a:b]
-            if HOLIDAY_WORDS.search(s):
-                out.update(x.day for x in find_dates(s))
-                out.update(_year_less_dates(s, years))
-    return out
+            if not HOLIDAY_WORDS.search(s):
+                continue
+            full = find_dates(s)[:budget]
+            budget -= len(full)
+            out.update((x.day, None) for x in full)
+            for m in islice(DATE_NO_YEAR.finditer(s), max(budget, 0)):
+                budget -= 1
+                for y in years:
+                    d = _make_date(y, MONTHS[m.group(2).lower()], int(m.group(1)))
+                    if d:
+                        out[d] = None
+    return set(list(out)[:MAX_HOLIDAYS])
 
 
 def _today(text: str, dates: list[_Date]) -> _Date | None:
@@ -562,7 +568,7 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
 
     # --- dates
     dates = find_dates(state)
-    years = {x.day.year for x in dates} | {x.day.year for x in find_dates(rule)}
+    years = list(dict.fromkeys(x.day.year for x in dates + find_dates(rule)))[:MAX_YEARS]
     holidays = _holidays([state, rule], years)
     workdays = bool(WORKDAY_WORDS.search(state) or WORKDAY_WORDS.search(rule))
     today = _today(state, dates)

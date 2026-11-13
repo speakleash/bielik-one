@@ -419,3 +419,22 @@ def test_today_needs_the_date_right_after_the_word():
 def test_the_german_article_des_is_not_december():
     assert find_dates("Nach Artikel 5 des 2020 erlassenen Gesetzes") == []
     assert [x.day for x in find_dates("Frist: 5. des. 2026")] == [date(2026, 12, 5)]
+
+
+def test_days_off_share_one_budget_over_sentences_and_years():
+    import time
+
+    from bielik_one.prompting.facts import MAX_HOLIDAYS, _holidays
+
+    # 300 distinct years, thousands of short holiday sentences, and many sentences of year-less dates
+    rule = "Within 10 working days? Holiday " + " ".join(f"1.1.{y}" for y in range(1900, 2200))
+    state = "\n".join(
+        [f"Holiday {i % 28 + 1} May {1900 + i % 300}." for i in range(2_000)]
+        + ["Holiday " + " ".join(f"{d % 28 + 1} May" for d in range(300)) for _ in range(20)]
+        + ["Sent 1 June 2027, due 30 June 2027, 1 July 2027."]
+    )
+    start = time.perf_counter()
+    lines, _ = facts(state, [rule])
+    assert time.perf_counter() - start < 1.0
+    assert len(lines) <= 40
+    assert len(_holidays([state, rule], list(range(1900, 2200)))) <= MAX_HOLIDAYS
