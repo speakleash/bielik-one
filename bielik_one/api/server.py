@@ -33,6 +33,7 @@ from bielik_one.prompting.schema import (
 )
 
 KINDS = ("choice", "noul", "score")
+DEFAULT_READ_TWICE_MAX_INPUT_TOKENS = 4096
 MAX_PERMUTATIONS = 16
 MAX_QUESTIONS = 64
 MAX_STATE_CHARS = 400_000  # well above a 32768-token context; longer prompts are rejected by the backend anyway
@@ -103,7 +104,9 @@ class SystemOneIn(BaseModel):
     temperature: float | dict[str, float] | None = None
     questions_before_state: bool = False
     read_twice: bool = True
-    read_twice_max_input_tokens: int | None = Field(default=4096, ge=0, strict=True)
+    read_twice_max_input_tokens: int | None = Field(
+        default=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS, ge=0, strict=True
+    )
     reasoning: Literal["off", "on", "auto"] = "off"
     reasoning_model: Literal["original"] = "original"
     reasoning_threshold: float = Field(default=0.9, ge=0, le=1, allow_inf_nan=False)

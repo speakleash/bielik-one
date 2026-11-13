@@ -15,6 +15,7 @@ import httpx
 from fastapi import Request
 
 from bielik_one.api.server import (
+    DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
     LetterEngine,
     RequestError,
     SystemOneIn,
@@ -34,6 +35,9 @@ from bielik_one.prompting.letter import answer_token_ids
 
 # vLLM 0.32 caps logprob_token_ids at 128 per request (vllm.sampling_params.MAX_LOGPROB_TOKEN_IDS).
 MAX_LOGPROB_TOKEN_IDS = 128
+
+# Request-local collection: concurrent requests must never share inference metadata.
+_prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
 
 # calibration.json uses benchmark names; the TypeSafe API calls binary questions "noul".
 CALIBRATION_KINDS = {
@@ -306,7 +310,7 @@ class RemoteVllmEngine(LetterEngine):
         questions=(),
         questions_before_state=False,
         read_twice=False,
-        read_twice_max_input_tokens=4096,
+        read_twice_max_input_tokens=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
         analyses=None,
     ):
         tasks = []
@@ -330,6 +334,9 @@ class RemoteVllmEngine(LetterEngine):
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
                 )
+            standard_tokens = len(ids)
+            applied = False
+            reason = "input_threshold" if read_twice else "disabled"
             # Count the complete standard prompt, including question previews/analysis.
             # Repetition is conditional even when explicitly enabled. Never truncate either variant.
             if read_twice and (
@@ -347,6 +354,21 @@ class RemoteVllmEngine(LetterEngine):
                 )
                 if len(repeated) + 1 <= self.max_model_len:
                     ids = repeated
+                    applied = True
+                    reason = "applied"
+                else:
+                    reason = "context_limit"
+            variants = _prompt_variants.get()
+            if variants is not None:
+                variants.append((
+                    row.id,
+                    {
+                        "read_twice": applied,
+                        "reason": reason,
+                        "standard_input_tokens": standard_tokens,
+                        "input_tokens": len(ids),
+                    },
+                ))
             outputs = (
                 self.parking["option_ids"][: len(row.options)]
                 if kind == "labels"
@@ -362,7 +384,23 @@ class RemoteVllmEngine(LetterEngine):
         return [table for table, _ in results], sum(tokens for _, tokens in results)
 
     def _evaluate_once(self, body, **kwargs):
-        result = super()._evaluate_once(body, **kwargs)
+        variants = []
+        token = _prompt_variants.set(variants)
+        try:
+            result = super()._evaluate_once(body, **kwargs)
+        finally:
+            _prompt_variants.reset(token)
+        for name, answer in result["answers"].items():
+            reads = [record for question_id, record in variants if question_id == name]
+            if reads:
+                applied = {record["read_twice"] for record in reads}
+                answer["inference"] = {
+                    "requested_read_twice": body.read_twice,
+                    "read_twice": next(iter(applied)) if len(applied) == 1 else "mixed",
+                    "read_twice_reads": sum(record["read_twice"] for record in reads),
+                    "standard_reads": sum(not record["read_twice"] for record in reads),
+                    "reads": reads,
+                }
         calls = 0
         seed = 0 if body.seed is None else body.seed
         for question in body.questions.values():
