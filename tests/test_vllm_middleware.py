@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -63,8 +64,9 @@ class ServerAuth:
         return await self.app(scope, receive, send)
 
 
-def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_startup=False):
-    engine = Engine()
+def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_startup=False, engine=None,
+             server_count=None, **settings):
+    engine = engine if engine is not None else Engine()
     startup = []
 
     @asynccontextmanager
@@ -78,11 +80,11 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
             startup.append("shutdown")
 
     app = FastAPI(lifespan=lifespan, root_path=root_path)
-    app.state.args = SimpleNamespace(api_key=list(keys))
+    app.state.args = SimpleNamespace(api_key=list(keys), api_server_count=server_count)
     cards = cards if cards is not None else [
         {"id": "base-a", "parent": None},
         {"id": "base-b", "parent": None},
-        {"id": "systemone-decision", "parent": "base-a"},
+        {"id": "decision", "parent": "base-a"},
     ]
 
     @app.get("/v1/models")
@@ -92,6 +94,9 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
     @app.post("/v1/chat/completions")
     @app.post("/v1/completions")
     @app.post("/v1/responses")
+    @app.post("/v1/messages")
+    @app.post("/v1/load_lora_adapter")
+    @app.post("/v1/unload_lora_adapter")
     async def generate(request: Request):
         body = await request.json()
         if body.get("stream"):
@@ -109,7 +114,7 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
                        allow_methods=["POST"], allow_headers=["Authorization", "Content-Type"])
     app.add_middleware(ServerAuth, keys=keys or ([env_key] if env_key else []))
     app.add_middleware(middleware.SystemOneMiddleware,
-                       settings=middleware.Settings(api_key=env_key, max_body_mb=limit), engine=engine)
+                       settings=middleware.Settings(api_key=env_key, max_body_mb=limit, **settings), engine=engine)
     app.middleware_stack = app.build_middleware_stack()
     owner = app.middleware_stack
     while not isinstance(owner, middleware.SystemOneMiddleware):
@@ -131,7 +136,7 @@ def test_internal_adapter_is_never_public(content_type, path):
     app, _, _, _ = make_app()
     with TestClient(app) as client:
         headers = {"content-type": content_type} if content_type else {}
-        response = client.post(path, content=json.dumps({"model": "systemone-decision"}).encode(), headers=headers)
+        response = client.post(path, content=json.dumps({"model": "decision"}).encode(), headers=headers)
         assert response.status_code == 400
 
 
@@ -181,7 +186,7 @@ def test_cors_preflight_success_and_errors_use_vllm_configuration():
         assert response.headers["access-control-allow-origin"] == "https://client.example"
         headers = {"Origin": "https://client.example", "Authorization": "Bearer key"}
         for path, body in [("/v1/systemone", decision()),
-                           ("/v1/chat/completions", {"model": "systemone-decision"})]:
+                           ("/v1/chat/completions", {"model": "decision"})]:
             response = client.post(path, json=body, headers=headers)
             assert response.status_code in (200, 400)
             assert response.headers["access-control-allow-origin"] == "https://client.example"
@@ -228,7 +233,7 @@ def test_decisions_reuse_engine_and_public_aliases(kind):
 
 @pytest.mark.parametrize("cards", [
     [{"id": "base-a", "parent": None}],
-    [{"id": "base-a", "parent": None}, {"id": "systemone-decision", "parent": None}],
+    [{"id": "base-a", "parent": None}, {"id": "decision", "parent": None}],
 ])
 def test_missing_or_misidentified_adapter_fails_before_inference(cards):
     app, _, engine, _ = make_app(cards=cards)
@@ -300,7 +305,8 @@ def test_build_engine_reuses_adapter_metadata_and_calibration(tmp_path, monkeypa
     try:
         assert seen["metadata"]["adapter"] == str(tmp_path / "adapter")
         assert seen["metadata"]["heads_manifest"] == str(tmp_path / "heads.json")
-        assert seen["backend_model"] == "systemone-decision"
+        assert seen["backend_model"] == "decision"
+        assert seen["workers"] == 8  # `bielik-one frontend` value for Llama adapter packages
         assert seen["calibration"] == {"1": {"choice": 2.0}}
         assert engine.aliases == set()
     finally:
@@ -321,3 +327,116 @@ def test_explicit_reasoning_key_takes_precedence_over_environment(monkeypatch):
         open_request.return_value.__enter__.return_value = response
         reasoner(row, 10)
         assert open_request.call_args.args[0].get_header("Authorization") == "Bearer config-key"
+
+
+class CountingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, inner):
+        self.inner, self.calls = inner, 0
+
+    async def handle_async_request(self, request):
+        self.calls += 1
+        return await self.inner.handle_async_request(request)
+
+
+def test_multiple_api_servers_require_a_shared_internal_token():
+    app, _, engine, events = make_app(server_count=2)
+    with pytest.raises(RuntimeError, match="SYSTEMONE_INTERNAL_TOKEN"):
+        with TestClient(app):
+            pass
+    assert engine.closed == 1 and not events  # vLLM startup is not entered
+    app, _, _, _ = make_app(server_count=2, internal_token="shared", shared_token=True)
+    with TestClient(app) as client:
+        assert client.post("/v1/systemone", json=decision()).status_code == 200
+
+
+def test_settings_from_env():
+    settings = middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package"})
+    assert settings.lora_name == "decision" and settings.workers is None and not settings.shared_token
+    settings = middleware.Settings.from_env(
+        {"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_INTERNAL_TOKEN": "s", "SYSTEMONE_WORKERS": "32"}
+    )
+    assert settings.internal_token == "s" and settings.shared_token and settings.workers == 32
+    with pytest.raises(RuntimeError, match="SYSTEMONE_WORKERS"):
+        middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_WORKERS": "many"})
+
+
+def test_non_json_content_type_is_still_filtered():
+    app, _, _, _ = make_app()
+    with TestClient(app) as client:
+        headers = {"content-type": "text/plain"}
+        response = client.post("/v1/messages", content=b'{"model": "decision"}', headers=headers)
+        assert response.status_code == 400
+        response = client.post("/v1/messages", content=b'{"model": "base-a", "vllm_xargs": {"a": 1}}', headers=headers)
+        assert response.status_code == 200 and "vllm_xargs" not in response.json()["received"]
+
+
+def test_runtime_lora_updates_cannot_touch_the_decision_adapter(tmp_path):
+    (tmp_path / "adapter").mkdir()
+    app, _, _, _ = make_app(package=tmp_path.resolve())
+    with TestClient(app) as client:
+        assert client.post("/v1/unload_lora_adapter", json={"lora_name": "decision"}).status_code == 400
+        assert client.post("/v1/load_lora_adapter", json={"lora_name": "decision", "lora_path": "/x"}).status_code == 400
+        for path in (tmp_path / "adapter", tmp_path):
+            response = client.post("/v1/load_lora_adapter", json={"lora_name": "copy", "lora_path": str(path)})
+            assert response.status_code == 400
+        other = {"lora_name": "other", "lora_path": str(tmp_path.parent / "other-adapter")}
+        assert client.post("/v1/load_lora_adapter", json=other).status_code == 200
+        assert client.post("/v1/unload_lora_adapter", json={"lora_name": "other"}).status_code == 200
+
+
+def test_tls_request_without_self_url_explains_the_setting():
+    app, owner, _, _ = make_app()
+    owner.check_transport = CountingTransport(owner.check_transport)
+    with TestClient(app, base_url="https://testserver") as client:
+        response = client.post("/v1/systemone", json=decision())
+        assert response.status_code == 500 and "SYSTEMONE_SELF_URL" in response.text
+    assert owner.check_transport.calls == 0
+
+
+def test_failed_discovery_is_remembered_briefly(monkeypatch):
+    app, owner, engine, _ = make_app(cards=[{"id": "base-a", "parent": None}])
+    owner.check_transport = CountingTransport(owner.check_transport)
+    with TestClient(app) as client:
+        for _ in range(3):
+            response = client.post("/v1/systemone", json=decision())
+            assert response.status_code == 503 and response.headers["retry-after"] == "5"
+        assert owner.check_transport.calls == 1
+        monkeypatch.setattr(middleware, "BIND_RETRY_SECONDS", 0)
+        assert client.post("/v1/systemone", json=decision()).status_code == 503
+        assert owner.check_transport.calls == 2
+    assert not engine.requests
+
+
+def test_routed_packages_read_base_rows_under_the_served_name():
+    engine = Engine()
+    engine.base_row_types = {"noul"}
+    engine.base_alias = "unbound"
+    app, _, _, _ = make_app(engine=engine)
+    with TestClient(app) as client:
+        assert client.post("/v1/systemone", json=decision("base-b", "noul")).status_code == 200
+    assert engine.base_alias == "base-a" and engine.backend_url.startswith("http://")
+
+
+def test_build_engine_removes_its_temporary_metadata(tmp_path, monkeypatch):
+    from tests.test_launch import package
+    from bielik_one import launch
+    from bielik_one.api import remote_vllm
+
+    package("llama-adapter", tmp_path)
+    monkeypatch.setenv("SYSTEMONE_HEADS_MANIFEST", str(tmp_path / "heads.json"))
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    written = []
+    original = launch.frontend
+
+    def frontend(*args, **kwargs):
+        argv = original(*args, **kwargs)
+        written.append(Path(argv[argv.index("--metadata") + 1]))
+        return argv
+
+    monkeypatch.setattr(launch, "frontend", frontend)
+    with patch.object(remote_vllm, "RemoteVllmEngine",
+                      side_effect=lambda metadata, url, **kw: SimpleNamespace(aliases=set(), client=kw["client"])), \
+            patch.object(remote_vllm, "resolve_calibration", return_value=({}, None)):
+        engine = middleware.build_engine(middleware.Settings(package=tmp_path, workers=3))
+    engine.client.close()
+    assert written and not written[0].parent.exists()
