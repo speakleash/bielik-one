@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 import contextvars
 import json
 import math
+import time
 from pathlib import Path
 
 import httpx
@@ -35,6 +36,12 @@ from bielik_one.prompting.letter import answer_token_ids
 
 # vLLM 0.32 caps logprob_token_ids at 128 per request (vllm.sampling_params.MAX_LOGPROB_TOKEN_IDS).
 MAX_LOGPROB_TOKEN_IDS = 128
+
+# Prompt tokens one request may send in all, counted on the standard prompts (read twice can at most double what is
+# sent). 64 questions over a 32k-token state is about 2.1M; the cap leaves room for two option orders of that.
+DEFAULT_MAX_REQUEST_TOKENS = 4_194_304
+# Wall-clock budget for one request's decision reads, from tokenization to the last read.
+DEFAULT_REQUEST_TIMEOUT = 600.0
 
 # Request-local collection: concurrent requests must never share inference metadata.
 _prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
@@ -143,8 +150,17 @@ class RemoteVllmEngine(LetterEngine):
         workers=8,
         calibration=None,
         calibration_source=None,
+        max_request_tokens=DEFAULT_MAX_REQUEST_TOKENS,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
     ):
         from transformers import AutoTokenizer
+
+        if max_request_tokens is not None and max_request_tokens < 1:
+            raise ValueError("max_request_tokens must be at least 1")
+        if request_timeout is not None and not (math.isfinite(request_timeout) and request_timeout > 0):
+            raise ValueError("request_timeout must be a finite number of seconds greater than 0")
+        self.max_request_tokens = max_request_tokens
+        self.request_timeout = request_timeout
 
         self.tok = (
             tokenizer
@@ -316,7 +332,9 @@ class RemoteVllmEngine(LetterEngine):
     ):
         if first_rows and len(first_rows) != len(orders):
             raise ValueError("Expected one original row per decision read")
+        started = time.monotonic()
         standard = []
+        standard_tokens = 0
         groups = {}
         for index, row in enumerate(orders):
             if row.question.type == "labels" and len(row.options) > self.labels_capacity:
@@ -332,6 +350,15 @@ class RemoteVllmEngine(LetterEngine):
             if len(ids) + 1 > self.max_model_len:
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
+                )
+            # Checked while the prompts are built, so an oversized request stops before it holds them all.
+            standard_tokens += len(ids)
+            if self.max_request_tokens is not None and standard_tokens > self.max_request_tokens:
+                raise RequestError(
+                    ["questions"],
+                    f"the decision reads of this request need more than {self.max_request_tokens} prompt tokens "
+                    "in all (questions x option orders x prompt length); send fewer questions or option orders, "
+                    "or a shorter state",
                 )
             standard.append(ids)
             groups.setdefault(row.id, []).append(index)
@@ -381,7 +408,23 @@ class RemoteVllmEngine(LetterEngine):
             self.pool.submit(contextvars.copy_context().run, self._read, *task)
             for task in tasks
         ]
-        results = [future.result() for future in futures]
+        deadline = None if self.request_timeout is None else started + self.request_timeout
+        try:
+            results = [
+                future.result(
+                    timeout=None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                for future in futures
+            ]
+        except TimeoutError as exc:
+            raise BackendReadError(
+                f"vLLM did not finish the decision reads within {self.request_timeout:g} s"
+            ) from exc
+        finally:
+            # The pool outlives the request: once the answer is known (or has failed), reads still queued for it
+            # would only load the backend. Reads already running finish on their own; finished ones are unaffected.
+            for future in futures:
+                future.cancel()
         return [table for table, _ in results], sum(tokens for _, tokens in results)
 
     def _evaluate_once(self, body, **kwargs):
@@ -487,7 +530,7 @@ def install_backend_errors(app, error_format: str = "default"):
     @app.exception_handler(BackendReadError)
     async def backend_error(request, exc):
         log.warning("decision read failed: %s (cause: %r)", exc, exc.__cause__)
-        if isinstance(exc.__cause__, httpx.TimeoutException):
+        if isinstance(exc.__cause__, (httpx.TimeoutException, TimeoutError)):
             return failure(request, 504, TIMEOUT, "vLLM did not answer in time")
         return failure(request, 502, BACKEND_UNAVAILABLE, str(exc))
 
@@ -626,6 +669,43 @@ def add_calibration_arguments(parser):
     )
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError("must be a finite number of seconds greater than 0")
+    return value
+
+
+def add_limit_arguments(parser):
+    parser.add_argument(
+        "--max-request-tokens",
+        type=_positive_int,
+        default=DEFAULT_MAX_REQUEST_TOKENS,
+        help="prompt tokens one /v1/systemone request may send in all, counted on the standard prompts; "
+        f"larger requests get HTTP 422 (default: {DEFAULT_MAX_REQUEST_TOKENS})",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=_positive_seconds,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="seconds one /v1/systemone request may spend on its decision reads; slower ones get HTTP 504 "
+        f"(default: {DEFAULT_REQUEST_TIMEOUT:g})",
+    )
+
+
 def main():
     import uvicorn
     from bielik_one.api.reasoning import EndpointReasoner
@@ -643,6 +723,7 @@ def main():
     )
     add_calibration_arguments(parser)
     add_guard_arguments(parser)
+    add_limit_arguments(parser)
     args = parser.parse_args()
     metadata = json.loads(args.metadata.read_text())
     table, source = resolve_calibration(
@@ -660,6 +741,8 @@ def main():
         workers=args.workers,
         calibration=table,
         calibration_source=source,
+        max_request_tokens=args.max_request_tokens,
+        request_timeout=args.request_timeout,
     )
     engine.reasoners["original"] = EndpointReasoner(
         args.backend_url + "/v1", args.base_model, tok=getattr(engine, "tok", None)

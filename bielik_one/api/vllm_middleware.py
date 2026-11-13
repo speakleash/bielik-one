@@ -41,6 +41,9 @@ Environment:
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
 - SYSTEMONE_MAX_BODY_MB: largest decision or public request body (default 16); form uploads are not limited here.
+- SYSTEMONE_MAX_REQUEST_TOKENS: prompt tokens one decision request may send in all, counted on the standard prompts
+  (default 4194304); larger requests get 422, as with `bielik-one frontend --max-request-tokens`.
+- SYSTEMONE_REQUEST_TIMEOUT: seconds one decision request may spend on its reads (default 600); slower ones get 504.
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
   --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API
   process, so a shared value is required then (the server refuses to start without it).
@@ -100,6 +103,8 @@ class Settings:
     calibration: bool = True
     workers: int | None = None  # None: the value `bielik-one frontend` uses for the package
     max_body_mb: float = 16
+    max_request_tokens: int = 4_194_304  # remote_vllm.DEFAULT_MAX_REQUEST_TOKENS
+    request_timeout: float = 600.0  # remote_vllm.DEFAULT_REQUEST_TIMEOUT
 
     @classmethod
     def from_env(cls, env=None) -> "Settings":
@@ -114,6 +119,13 @@ class Settings:
             max_body_mb = float(env.get("SYSTEMONE_MAX_BODY_MB") or 16)
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
+        try:
+            max_request_tokens = int(env.get("SYSTEMONE_MAX_REQUEST_TOKENS") or cls.max_request_tokens)
+            request_timeout = float(env.get("SYSTEMONE_REQUEST_TIMEOUT") or cls.request_timeout)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"SystemOne middleware: invalid SYSTEMONE_MAX_REQUEST_TOKENS or SYSTEMONE_REQUEST_TIMEOUT ({exc})"
+            )
         settings = cls(
             public_name=public,
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
@@ -124,6 +136,8 @@ class Settings:
             calibration=not _flag(env.get("SYSTEMONE_NO_CALIBRATION")),
             workers=workers,
             max_body_mb=max_body_mb,
+            max_request_tokens=max_request_tokens,
+            request_timeout=request_timeout,
         )
         if env.get("SYSTEMONE_INTERNAL_TOKEN"):
             settings.internal_token = env["SYSTEMONE_INTERNAL_TOKEN"]
@@ -136,6 +150,10 @@ class Settings:
             raise RuntimeError("SYSTEMONE_WORKERS must be between 1 and 256")
         if not math.isfinite(settings.max_body_mb) or settings.max_body_mb * 2**20 < 1:
             raise RuntimeError("SYSTEMONE_MAX_BODY_MB must be finite and at least one byte")
+        if settings.max_request_tokens < 1:
+            raise RuntimeError("SYSTEMONE_MAX_REQUEST_TOKENS must be at least 1")
+        if not (math.isfinite(settings.request_timeout) and settings.request_timeout > 0):
+            raise RuntimeError("SYSTEMONE_REQUEST_TIMEOUT must be a finite number of seconds greater than 0")
         return settings
 
     def ssl_context(self) -> ssl.SSLContext | None:
@@ -206,6 +224,8 @@ def build_engine(settings: Settings):
             calibration=table,
             calibration_source=source,
             client=client,
+            max_request_tokens=settings.max_request_tokens,
+            request_timeout=settings.request_timeout,
         )
     except BaseException:
         client.close()

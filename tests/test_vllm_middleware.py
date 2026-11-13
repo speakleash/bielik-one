@@ -569,3 +569,30 @@ def test_token_in_requests_cannot_set_backend_flags():
             assert client.post("/inference/v1/generate", json=body).status_code == 400
         body = {"model": "decision", "token_ids": [1]}
         assert client.post("/inference/v1/generate", json=body).status_code == 400
+
+
+def test_request_limits_from_env():
+    from bielik_one.api import remote_vllm
+
+    settings = middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package"})
+    assert settings.max_request_tokens == remote_vllm.DEFAULT_MAX_REQUEST_TOKENS
+    assert settings.request_timeout == remote_vllm.DEFAULT_REQUEST_TIMEOUT
+    settings = middleware.Settings.from_env(
+        {"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_MAX_REQUEST_TOKENS": "1000", "SYSTEMONE_REQUEST_TIMEOUT": "30"}
+    )
+    assert (settings.max_request_tokens, settings.request_timeout) == (1000, 30.0)
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("SYSTEMONE_MAX_REQUEST_TOKENS", "0"),
+        ("SYSTEMONE_MAX_REQUEST_TOKENS", "many"),
+        ("SYSTEMONE_REQUEST_TIMEOUT", "0"),
+        ("SYSTEMONE_REQUEST_TIMEOUT", "inf"),
+        ("SYSTEMONE_REQUEST_TIMEOUT", "nan"),
+    ],
+)
+def test_invalid_request_limits_are_rejected(name, value):
+    with pytest.raises(RuntimeError, match=name):
+        middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package", name: value})
