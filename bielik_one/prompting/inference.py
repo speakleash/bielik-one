@@ -25,6 +25,7 @@ def inference_messages(
     questions: Sequence[Row] = (),
     questions_before_state: bool = False,
     read_twice: bool = False,
+    first_row: Row | None = None,
     analysis: str = "",
     header_style: str = "full",
 ) -> list[dict]:
@@ -69,7 +70,19 @@ def inference_messages(
             raise ValueError(f"unknown question header style: {header_style}")
         content += "\n\nTarget question: " + json.dumps(row.id, ensure_ascii=False)
     if read_twice:
-        content = content + "\n\nRead the input again:\n" + content
+        # Positional letters must mean the same option in both copies. Only semantic
+        # yes/no and score digits keep their meaning when the option order changes.
+        first = content
+        if (
+            semantic and row.question.type in SEMANTIC_TYPES
+            and first_row is not None and first_row != row
+        ):
+            first = inference_messages(
+                tok, first_row, semantic,
+                questions=questions, questions_before_state=questions_before_state,
+                header_style=header_style,
+            )[-1]["content"].rsplit("\n\n", 1)[0]
+        content = first + "\n\nRead the input again:\n" + content
     if analysis:
         content += (
             "\n\nAuxiliary analysis (may contain errors; verify against the state):\n"

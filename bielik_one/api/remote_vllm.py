@@ -15,6 +15,7 @@ import httpx
 from fastapi import Request
 
 from bielik_one.api.server import (
+    DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
     LetterEngine,
     RequestError,
     SystemOneIn,
@@ -34,6 +35,9 @@ from bielik_one.prompting.letter import answer_token_ids
 
 # vLLM 0.32 caps logprob_token_ids at 128 per request (vllm.sampling_params.MAX_LOGPROB_TOKEN_IDS).
 MAX_LOGPROB_TOKEN_IDS = 128
+
+# Request-local collection: concurrent requests must never share inference metadata.
+_prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
 
 # calibration.json uses benchmark names; the TypeSafe API calls binary questions "noul".
 CALIBRATION_KINDS = {
@@ -304,35 +308,72 @@ class RemoteVllmEngine(LetterEngine):
         orders,
         *,
         questions=(),
+        first_rows=(),
         questions_before_state=False,
         read_twice=False,
+        read_twice_max_input_tokens=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
         analyses=None,
     ):
-        tasks = []
-        for row in orders:
-            kind = row.question.type
-            if kind == "labels" and len(row.options) > self.labels_capacity:
+        if first_rows and len(first_rows) != len(orders):
+            raise ValueError("Expected one original row per decision read")
+        standard = []
+        groups = {}
+        for index, row in enumerate(orders):
+            if row.question.type == "labels" and len(row.options) > self.labels_capacity:
                 raise RequestError(
                     ["questions", row.id, "criteria"],
                     f"labels supports at most {self.labels_capacity} options",
                 )
             ids = inference_ids(
-                self.tok,
-                row,
-                self.semantic,
-                questions=questions,
-                questions_before_state=questions_before_state,
-                read_twice=read_twice,
+                self.tok, row, self.semantic, questions=questions,
+                questions_before_state=questions_before_state, read_twice=False,
                 analysis=(analyses or {}).get(row.id, ""),
             )
             if len(ids) + 1 > self.max_model_len:
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
                 )
+            standard.append(ids)
+            groups.setdefault(row.id, []).append(index)
+
+        selected = list(standard)
+        decisions = {}
+        for name, indices in groups.items():
+            reason = "disabled"
+            if read_twice:
+                longest = max(len(standard[i]) for i in indices)
+                if read_twice_max_input_tokens is not None and longest > read_twice_max_input_tokens:
+                    reason = "input_threshold"
+                else:
+                    repeated = [inference_ids(
+                        self.tok, orders[i], self.semantic,
+                        first_row=first_rows[i] if first_rows else orders[i],
+                        questions=questions, questions_before_state=questions_before_state,
+                        read_twice=True, analysis=(analyses or {}).get(name, ""),
+                    ) for i in indices]
+                    if all(len(ids) + 1 <= self.max_model_len for ids in repeated):
+                        reason = "applied"
+                        for i, ids in zip(indices, repeated, strict=True):
+                            selected[i] = ids
+                    else:
+                        reason = "context_limit"
+            decisions[name] = reason
+
+        tasks = []
+        variants = _prompt_variants.get()
+        for row, base, ids in zip(orders, standard, selected, strict=True):
+            kind = row.question.type
+            reason = decisions[row.id]
+            if variants is not None:
+                variants.append((row.id, {
+                    "read_twice": reason == "applied",
+                    "reason": reason,
+                    "standard_input_tokens": len(base),
+                    "input_tokens": len(ids),
+                }))
             outputs = (
-                self.parking["option_ids"][: len(row.options)]
-                if kind == "labels"
-                else answer_token_ids(self.tok, row, self.semantic)
+                self.parking["option_ids"][:len(row.options)]
+                if kind == "labels" else answer_token_ids(self.tok, row, self.semantic)
             )
             tasks.append((ids, list(outputs), kind))
         # Each read runs in a copy of the request's context, so it sees the request id.
@@ -344,7 +385,27 @@ class RemoteVllmEngine(LetterEngine):
         return [table for table, _ in results], sum(tokens for _, tokens in results)
 
     def _evaluate_once(self, body, **kwargs):
-        result = super()._evaluate_once(body, **kwargs)
+        variants = []
+        token = _prompt_variants.set(variants)
+        try:
+            result = super()._evaluate_once(body, **kwargs)
+        finally:
+            _prompt_variants.reset(token)
+        for name, answer in result["answers"].items():
+            reads = [record for question_id, record in variants if question_id == name]
+            if reads:
+                applied = all(record["read_twice"] for record in reads)
+                answer["prompt"] = {
+                    "requested_read_twice": body.read_twice,
+                    "variant": "read_twice" if applied else "standard",
+                    "reason": reads[0]["reason"],
+                    "read_twice_max_input_tokens": body.read_twice_max_input_tokens,
+                    "max_context_tokens": self.max_model_len,
+                    "read_twice_reads": sum(record["read_twice"] for record in reads),
+                    "standard_reads": sum(not record["read_twice"] for record in reads),
+                }
+                if body.prompt_details:
+                    answer["prompt"]["reads"] = reads
         calls = 0
         seed = 0 if body.seed is None else body.seed
         for question in body.questions.values():
