@@ -306,6 +306,7 @@ class RemoteVllmEngine(LetterEngine):
         questions=(),
         questions_before_state=False,
         read_twice=False,
+        read_twice_max_input_tokens=4096,
         analyses=None,
     ):
         tasks = []
@@ -322,13 +323,30 @@ class RemoteVllmEngine(LetterEngine):
                 self.semantic,
                 questions=questions,
                 questions_before_state=questions_before_state,
-                read_twice=read_twice,
+                read_twice=False,
                 analysis=(analyses or {}).get(row.id, ""),
             )
             if len(ids) + 1 > self.max_model_len:
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
                 )
+            # Count the complete standard prompt, including question previews/analysis.
+            # Repetition is conditional even when explicitly enabled. Never truncate either variant.
+            if read_twice and (
+                read_twice_max_input_tokens is None
+                or len(ids) <= read_twice_max_input_tokens
+            ):
+                repeated = inference_ids(
+                    self.tok,
+                    row,
+                    self.semantic,
+                    questions=questions,
+                    questions_before_state=questions_before_state,
+                    read_twice=True,
+                    analysis=(analyses or {}).get(row.id, ""),
+                )
+                if len(repeated) + 1 <= self.max_model_len:
+                    ids = repeated
             outputs = (
                 self.parking["option_ids"][: len(row.options)]
                 if kind == "labels"

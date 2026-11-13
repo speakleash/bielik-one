@@ -102,7 +102,8 @@ class SystemOneIn(BaseModel):
     seed: int | None = None
     temperature: float | dict[str, float] | None = None
     questions_before_state: bool = False
-    read_twice: bool = False
+    read_twice: bool = True
+    read_twice_max_input_tokens: int | None = Field(default=4096, ge=0, strict=True)
     reasoning: Literal["off", "on", "auto"] = "off"
     reasoning_model: Literal["original"] = "original"
     reasoning_threshold: float = Field(default=0.9, ge=0, le=1, allow_inf_nan=False)
@@ -600,6 +601,7 @@ class LetterEngine:
                 questions=questions or [item[1] for item in prepared],
                 questions_before_state=body.questions_before_state,
                 read_twice=body.read_twice,
+                read_twice_max_input_tokens=body.read_twice_max_input_tokens,
                 analyses=analyses,
             )
         else:
