@@ -196,17 +196,21 @@ _UNIT_SUFFIX = [
     ("pt", r"pkt\.?|punkt\w*|points?|Punkte?n?|poeng"),
     ("ECTS", r"ECTS"),
 ]
-_NUM = r"\d{1,3}(?:[   .,]\d{3}){1,6}(?:[.,]\d{1,6})?|\d{1,15}(?:[.,]\d{1,6})?"  # bounded: no backtracking blow-up
-AMOUNT_SUFFIX = re.compile(r"(?<![\w.,/\-−])(?:(" + _NUM + r")\s?[-–]\s?)?(" + _NUM + r")\s?(?:"
+# Groups of three digits after a space (also no-break and narrow no-break), ".", "," or an apostrophe ("1'234.50");
+# ",-" is a whole amount ("1 234,-"). Bounded: no backtracking blow-up.
+_NUM = (r"(?:\d{1,3}(?:[ \u00a0\u202f.,'’]\d{3}){1,6}(?:[.,]\d{1,6})?|\d{1,15}(?:[.,]\d{1,6})?)"
+        r"(?:,[-–](?![\s\-–]?\d))?")
+AMOUNT_SUFFIX = re.compile(r"(?<![\w.,/\-−'’])(?:(" + _NUM + r")\s?[-–]\s?)?(" + _NUM + r")\s?(?:"
                            + "|".join(f"(?P<u{i}>{rx})"
                                       for i, (u, rx) in enumerate(_UNIT_SUFFIX)) + r")(?![\w])")
 _SUFFIX_GROUPS = [(f"u{i}", u) for i, (u, _) in enumerate(_UNIT_SUFFIX)]
-AMOUNT_PREFIX = re.compile(r"(?<![\-−])(£|€|\$|\b(?:GBP|EUR|USD|NOK|PLN|CHF|SEK|DKK|kr\.?))\s?(" + _NUM + r")(?![\d])", re.I)
+AMOUNT_PREFIX = re.compile(r"(?<![\-−'’])(£|€|\$|\b(?:GBP|EUR|USD|NOK|PLN|CHF|SEK|DKK|kr\.?))\s?(" + _NUM + r")(?![\d])", re.I)
 
 PERSONS = re.compile(r"\b(\d{1,2})\s+(?:osob[ya]?|osób|członk\w+|persons?|people|Personen|personer|"
                      r"members|Mitglieder|medlemmer)\b", re.I)
 PER_PERSON = re.compile(r"\b(?:na osobę|na jedną osobę|per person|per capita|pro Person|pro Kopf|per person|"
                         r"per hode)\b", re.I)
+MONEY = {"PLN", "EUR", "GBP", "USD", "NOK", "SEK", "DKK", "CHF"}
 NOT_ADDITIVE = {"mm", "cm", "m²"}  # dimensions of one piece are compared, not added
 # The rule speaks of a total: amounts of one sentence are then added up (a list is always added up).
 SUM_WORDS = re.compile(r"\b(?:sum(?!mar(?:y|ies)|mers?\b)\w*|łączn\w*|razem|dodaj\w*|total\w*|combined|altogether|"
@@ -243,7 +247,8 @@ def detect_language(text: str) -> str:
     for lang, stop in STOPWORDS.items():
         s = {w.lower() for w in stop}
         scores[lang] = sum(w in s for w in lower)
-    scores["pl"] += 2 * len(re.findall(r"[ąćęłńśźż]", text, re.I))
+    # the currency "zł" says nothing about the language of the text ("The fine was 12.500 zł.")
+    scores["pl"] += 2 * len(re.findall(r"[ąćęłńśźż]", re.sub(r"\bzł\b", "", text), re.I))
     scores["de"] += 2 * len(re.findall(r"[äöüß]", text, re.I))
     scores["nb"] += 2 * len(re.findall(r"[æøå]", text, re.I))
     best = max(LANGUAGES, key=lambda k: scores[k])
@@ -439,22 +444,42 @@ def _durations(texts: Sequence[str]) -> list[tuple[int, str]]:
 
 # ------------------------------------------------------------------ numbers
 
-def _number(raw: str, lang: str) -> Decimal | None:
-    s = raw.replace(" ", " ").replace(" ", " ")
+def _number(raw: str, lang: str, money: bool = False) -> Decimal | None:
+    """The value of a number as written, or None when it is malformed or ambiguous. With both "." and "," the last
+    one is the decimal separator ("1.234,56", "1,234.56"); ",-" means no decimals, so dots before it group thousands
+    ("1.234,-"). With one kind of separator followed by groups of exactly three digits, the language of the text
+    decides: the separator that is not its decimal separator groups thousands (English "12,500" = 12500; Polish,
+    German, Norwegian "12.500" = 12500). Its decimal separator before exactly three digits is a decimal for a
+    measurement ("25,055 mm" in Polish); for money ("12,500 zł" in Polish, "£12.500" in English) it can mean 12.5 or
+    12500, so the amount is not read."""
+    s = re.sub(r"[\u00a0\u202f'’]", " ", raw)
+    whole = s.endswith((",-", ",–"))
+    if whole:
+        s = s[:-2]
     if re.fullmatch(r"\d{1,3}(?: \d{3})+(?:[.,]\d+)?", s):
         s = s.replace(" ", "")
     if " " in s:
         return None
-    if lang == "en":
-        if re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", s):
-            s = s.replace(",", "")
+    dots, commas = s.count("."), s.count(",")
+    if dots and commas:  # the last separator is the decimal one
+        dec = "," if s.rfind(",") > s.rfind(".") else "."
+        group = "." if dec == "," else ","
+        if not re.fullmatch(rf"[1-9]\d{{0,2}}(?:{re.escape(group)}\d{{3}})+{re.escape(dec)}\d+", s):
+            return None
+        s = s.replace(group, "").replace(dec, ".")
+    elif dots or commas:
+        sep = "." if dots else ","
+        grouped = re.fullmatch(rf"[1-9]\d{{0,2}}(?:{re.escape(sep)}\d{{3}})+", s)  # "0,500" is never grouped
+        if whole or (grouped and (dots + commas > 1 or sep != ("." if lang == "en" else ","))):
+            if not grouped:
+                return None
+            s = s.replace(sep, "")  # thousands
+        elif grouped and money:
+            return None  # "12,500 zł" in Polish, "£12.500" in English: 12.5 or 12500
+        elif dots + commas > 1:
+            return None  # "1.2.3"
         else:
-            s = s.replace(",", ".")
-    else:
-        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+(?:,\d+)?", s):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", ".")
+            s = s.replace(sep, ".")
     try:
         return Decimal(s)
     except InvalidOperation:
@@ -480,11 +505,13 @@ class _Amount:
 
 
 def _places(raw: str, lang: str) -> int:
+    """Decimal places as written (0 for "1 234,-" and when the last separator groups thousands)."""
     m = re.search(r"[.,](\d+)$", raw)
     if not m:
         return 0
-    dec = "." if lang == "en" else ","
-    if raw[m.start()] != dec and len(m.group(1)) == 3:
+    sep = raw[m.start()]
+    if len(m.group(1)) == 3 and ("." if sep == "," else ",") not in raw and (
+            raw.count(sep) > 1 or sep != ("." if lang == "en" else ",")):
         return 0  # a thousands separator
     return len(m.group(1))
 
@@ -507,7 +534,7 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
     for m in islice(AMOUNT_PREFIX.finditer(text), MAX_MATCHES):
         if not free(m.start(), m.end()):
             continue
-        v = _number(m.group(2), lang)
+        v = _number(m.group(2), lang, money=True)
         if v is not None:
             sym = m.group(1)
             out.append(_Amount(m.start(), m.end(), v, _CUR_PREFIX[sym.lower()], _places(m.group(2), lang), True, sym))
@@ -528,7 +555,7 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
         for raw, start in ((m.group(1), m.start(1)), (m.group(2), m.start(2))):
             if raw is None:
                 continue
-            v = _number(raw, lang)
+            v = _number(raw, lang, money=unit in MONEY)
             if v is not None:
                 out.append(_Amount(start, m.end(), v, unit, _places(raw, lang), False, sym, ranged))
     out.sort(key=lambda a: a.start)
@@ -681,7 +708,7 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
         if len(persons) == 1:
             n = persons.pop()
             if n > 1:
-                money = [a for a in amounts if a.unit in ("PLN", "EUR", "GBP", "USD", "NOK", "SEK", "DKK", "CHF")]
+                money = [a for a in amounts if a.unit in MONEY]
                 for a in money[:MAX_PER_PERSON]:
                     r = a.value / n
                     lines.append(t["per_person"].format(a=_render_amount(a.value, a, lang), n=n,

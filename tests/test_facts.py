@@ -3,6 +3,7 @@ calendar facts, never a verdict; the default request is unchanged."""
 
 import math
 from datetime import date
+from decimal import Decimal as D
 
 import pytest
 
@@ -438,3 +439,61 @@ def test_days_off_share_one_budget_over_sentences_and_years():
     assert time.perf_counter() - start < 1.0
     assert len(lines) <= 40
     assert len(_holidays([state, rule], list(range(1900, 2200)))) <= MAX_HOLIDAYS
+
+
+# ------------------------------------------------------------------ decimal and thousands separators
+
+
+def values(text, lang):
+    from bielik_one.prompting.facts import find_amounts
+
+    return [x.value for x in find_amounts(text, lang)]
+
+
+ALL = ("pl", "en", "de", "nb")
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # unambiguous in every language
+        ("1,5 zł", {lang: [D("1.5")] for lang in ALL}),
+        ("1.5 zł", {lang: [D("1.5")] for lang in ALL}),
+        ("1 234,56 zł", {lang: [D("1234.56")] for lang in ALL}),
+        ("1.234,56 zł", {lang: [D("1234.56")] for lang in ALL}),  # the last separator is the decimal one
+        ("1,234.56 zł", {lang: [D("1234.56")] for lang in ALL}),
+        ("1 234.56 zł", {lang: [D("1234.56")] for lang in ALL}),
+        ("0,5%", {lang: [D("0.5")] for lang in ALL}),
+        ("0,500 zł", {lang: [D("0.5")] for lang in ALL}),  # a leading 0 never groups thousands
+        ("1'234.50 CHF", {lang: [D("1234.50")] for lang in ALL}),
+        ("1 234 zł", {lang: [D("1234")] for lang in ALL}),
+        ("1 234 zł", {lang: [D("1234")] for lang in ALL}),
+        ("€1.234,56", {lang: [D("1234.56")] for lang in ALL}),
+        ("1.234,56 €", {lang: [D("1234.56")] for lang in ALL}),
+        ("EUR 1,234.56", {lang: [D("1234.56")] for lang in ALL}),
+        ("$1,234.56", {lang: [D("1234.56")] for lang in ALL}),
+        ("NOK 1 234", {lang: [D("1234")] for lang in ALL}),
+        ("kr 1.234,-", {lang: [D("1234")] for lang in ALL}),  # ",-": no decimals, so the dot groups thousands
+        ("1 234,- zł", {lang: [D("1234")] for lang in ALL}),
+        ("1,000,000 USD", {lang: [D("1000000")] for lang in ALL}),
+        ("costs 1.5 kg.", {lang: [D("1.5")] for lang in ALL}),
+        ("version 1.2.3 kg", {lang: [] for lang in ALL}),
+        ("3. 5 kg", {lang: [D("5")] for lang in ALL}),  # a list number is not part of the amount
+        # one separator before exactly three digits: the language decides; money is not read when it could be both
+        ("12,500 zł", {"pl": [], "en": [D("12500")], "de": [], "nb": []}),
+        ("12.500 zł", {"pl": [D("12500")], "en": [], "de": [D("12500")], "nb": [D("12500")]}),
+        ("1.234 PLN", {"pl": [D("1234")], "en": [], "de": [D("1234")], "nb": [D("1234")]}),
+        ("€12.500", {"pl": [D("12500")], "en": [], "de": [D("12500")], "nb": [D("12500")]}),
+        ("25,055 mm", {"pl": [D("25.055")], "en": [D("25055")], "de": [D("25.055")], "nb": [D("25.055")]}),
+    ],
+)
+def test_decimal_and_thousands_separators(text, expected):
+    for lang, want in expected.items():
+        assert values(text, lang) == want, lang
+
+
+def test_english_text_quoting_a_polish_amount():
+    lines = lines_of("The Polish invoice of 1.234,56 zł was paid on time.", "Is the invoice above 1 000 zł?")
+    assert lines == ["1,234.56 zł > 1,000 zł"]  # read as 1234.56 although the text is English
+    # "12.500 zł" in English text could be 12.5 or 12500: no comparison rather than a wrong one
+    assert not any("12" in x for x in lines_of("The fine was 12.500 zł.", "Is the fine above 1 000 zł?"))
