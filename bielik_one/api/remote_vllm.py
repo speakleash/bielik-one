@@ -15,6 +15,7 @@ import httpx
 from fastapi import Request
 
 from bielik_one.api.server import (
+    CONTEXT_LIMIT,
     DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
     LetterEngine,
     RequestError,
@@ -330,9 +331,7 @@ class RemoteVllmEngine(LetterEngine):
                 analysis=(analyses or {}).get(row.id, ""),
             )
             if len(ids) + 1 > self.max_model_len:
-                raise RequestError(
-                    ["questions", row.id], "context limit exceeded; no truncation"
-                )
+                raise RequestError(["questions", row.id], CONTEXT_LIMIT)
             standard.append(ids)
             groups.setdefault(row.id, []).append(index)
 

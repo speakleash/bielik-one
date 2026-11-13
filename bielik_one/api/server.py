@@ -20,6 +20,8 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from bielik_one.api.labels_park import sigmoid_from_logprobs
+from bielik_one.prompting.facts import facts as compute_facts
+from bielik_one.prompting.facts import inject as inject_facts
 from bielik_one.prompting.intervals import at_temperature
 from bielik_one.prompting.letter import answer_token_ids
 from bielik_one.prompting.orders import _alt_orders, _reordered
@@ -36,6 +38,7 @@ KINDS = ("choice", "noul", "score")
 DEFAULT_READ_TWICE_MAX_INPUT_TOKENS = 4096
 MAX_PERMUTATIONS = 16
 MAX_QUESTIONS = 64
+CONTEXT_LIMIT = "context limit exceeded; no truncation"
 MAX_STATE_CHARS = 400_000  # well above a 32768-token context; longer prompts are rejected by the backend anyway
 MAX_QUESTIONS_CHARS = 400_000  # all question names, instructions, option names and texts together
 MAX_PROMPTS = MAX_QUESTIONS * MAX_PERMUTATIONS  # decision reads per request, after per-option expansion
@@ -108,6 +111,9 @@ class SystemOneIn(BaseModel):
         default=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS, ge=0, strict=True
     )
     prompt_details: bool = False
+    # Deterministic facts (calendar and number arithmetic) computed from the state and the instructions and appended
+    # to the state before the model reads it; see bielik_one/prompting/facts.py.
+    facts: bool = False
     reasoning: Literal["off", "on", "auto"] = "off"
     reasoning_model: Literal["original"] = "original"
     reasoning_threshold: float = Field(default=0.9, ge=0, le=1, allow_inf_nan=False)
@@ -716,6 +722,8 @@ class LetterEngine:
     reasoning_enabled = False
 
     def evaluate(self, body: SystemOneIn) -> dict[str, Any]:
+        if body.facts:
+            return self._evaluate_with_facts(body)
         if body.reasoning == "off":
             return self._evaluate_once(body)
         if not self.reasoning_enabled:
@@ -793,6 +801,29 @@ class LetterEngine:
             "reasoning_threshold": body.reasoning_threshold,
             "analyses": records,
         }
+        return result
+
+
+    def _evaluate_with_facts(self, body: SystemOneIn) -> dict[str, Any]:
+        """The request with the computed facts appended to its state; the response lists them under "facts"."""
+        state = state_text(body.state)
+        instructions = []
+        for name, question in body.questions.items():
+            instructions.append(_instructions(name, question.instructions))
+        lines, language = compute_facts(state, instructions)
+        extended = inject_facts(state, lines, language)
+        if len(extended) > MAX_STATE_CHARS:  # the facts never make a valid request invalid
+            lines, extended = [], state
+        try:
+            result = self.evaluate(body.model_copy(update={"state": extended, "facts": False}))
+        except RequestError as error:
+            # The facts count toward the read-twice threshold and the context like the rest of the state; when the
+            # standard prompt with them no longer fits the context, the request is read without them.
+            if not lines or error.msg != CONTEXT_LIMIT:
+                raise
+            lines = []
+            result = self.evaluate(body.model_copy(update={"state": state, "facts": False}))
+        result["facts"] = {"language": language, "lines": lines}
         return result
 
 
