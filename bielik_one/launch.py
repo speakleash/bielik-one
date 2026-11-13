@@ -1,12 +1,14 @@
 """Launch the vLLM backend and the typed decision API for a downloaded Bielik One model package.
 
     bielik-one backend  PACKAGE_DIR [--fp8] [--port N] [--dry-run]
+    bielik-one backend  PACKAGE_DIR --engine mlx [--base BASE_DIR] [--port N] [--dry-run]
     bielik-one frontend PACKAGE_DIR [--no-calibration] [--port N] [--backend-url URL] [--dry-run]
 
 PACKAGE_DIR is a snapshot of one of the Bielik One Hugging Face repositories (merged or -Adapter). The package
 kind is detected from its files; each kind starts with the profile validated for that package (see its card).
 Runtime files and weights listed in SHA256SUMS.json are verified before anything starts. The frontend applies the package's
-calibration.json unless --no-calibration is given.
+calibration.json unless --no-calibration is given. `--engine mlx` starts the Apple-silicon backend of an adapter
+package instead of vLLM (bielik_one.mlx_backend); the frontend is the same.
 """
 
 from __future__ import annotations
@@ -386,6 +388,30 @@ def frontend(
     ] + calibration_args(root, no_calibration)
 
 
+def mlx_backend(
+    root: Path,
+    kind: str,
+    host: str,
+    port: int,
+    base: str | None,
+    cache_limit_gb: float | None,
+    skip_base_check: bool,
+) -> tuple[list[str], dict]:
+    """The Apple-silicon backend (bielik_one.mlx_backend): adapter packages only, base model loaded once."""
+    if kind not in ("llama-adapter", "qwen-adapter"):
+        raise ValueError(
+            "the MLX backend serves adapter packages (*-Adapter); merged packages need vLLM"
+        )
+    argv = [sys.executable, "-m", "bielik_one.mlx_backend", str(root), "--host", host, "--port", str(port)]
+    if base is not None:
+        argv += ["--base", str(Path(base).expanduser().resolve())]
+    if cache_limit_gb is not None:
+        argv += ["--cache-limit-gb", str(cache_limit_gb)]
+    if skip_base_check:
+        argv.append("--skip-base-check")
+    return argv, {"TOKENIZERS_PARALLELISM": "false"}
+
+
 def override(argv: list[str], flag: str, value) -> list[str]:
     """Replace the value of `flag` in a built command (profile defaults stay when `value` is None)."""
     if value is None:
@@ -455,6 +481,29 @@ def main(argv=None):
         help="backend without CUDA graphs (shorter start, slower chat generation; decisions are unchanged)",
     )
     p.add_argument(
+        "--engine",
+        choices=["vllm", "mlx"],
+        default="vllm",
+        help="backend engine: vllm (NVIDIA GPU, default) or mlx (Apple silicon, adapter packages; "
+        "pip install 'bielik-one[mlx]')",
+    )
+    p.add_argument(
+        "--base",
+        metavar="DIR",
+        help="--engine mlx: local base model at the revision the package pins (default: download it to the HF cache)",
+    )
+    p.add_argument(
+        "--cache-limit-gb",
+        type=float,
+        metavar="GB",
+        help="--engine mlx: MLX buffer cache limit (default: 4)",
+    )
+    p.add_argument(
+        "--skip-base-check",
+        action="store_true",
+        help="--engine mlx: do not check the base model against the Hub's checksums of the pinned revision",
+    )
+    p.add_argument(
         "--max-body-mb",
         type=float,
         metavar="MB",
@@ -487,6 +536,22 @@ def main(argv=None):
             "--shell prints the vLLM backend command; start the API with "
             "'bielik-one frontend <package> --backend-url http://<host>:<port>'"
         )
+    def given(pairs):
+        return [flag for flag, value in pairs if value not in (None, False)]
+
+    mlx_only = given(
+        [("--base", a.base), ("--cache-limit-gb", a.cache_limit_gb), ("--skip-base-check", a.skip_base_check)]
+    )
+    if mlx_only and (a.engine != "mlx" or a.component != "backend"):
+        p.error(f"{', '.join(mlx_only)}: options of 'bielik-one backend <package> --engine mlx'")
+    if a.engine == "mlx" and a.component == "backend":
+        vllm_only = given(
+            [("--fp8", a.fp8), ("--eager", a.eager), ("--max-num-seqs", a.max_num_seqs), ("--kv-cache-gb", a.kv_cache_gb)]
+        )
+        if vllm_only:
+            p.error(f"{', '.join(vllm_only)}: vLLM options, not used by --engine mlx")
+        if a.cache_limit_gb is not None and not (math.isfinite(a.cache_limit_gb) and a.cache_limit_gb > 0):
+            p.error("--cache-limit-gb must be positive")
     if a.max_num_seqs is not None and not 1 <= a.max_num_seqs <= 256:
         p.error("--max-num-seqs must be between 1 and 256")
     if a.kv_cache_gb is not None and not a.kv_cache_gb > 0:
@@ -508,6 +573,15 @@ def main(argv=None):
             p.error(
                 "--host sets the frontend address; use --backend-host to bind the raw vLLM backend"
             )
+    mlx = a.component == "backend" and a.engine == "mlx"
+    if mlx:
+        try:
+            argv, extra = mlx_backend(
+                root, kind, a.backend_host, a.port or back_port, a.base, a.cache_limit_gb, a.skip_base_check
+            )
+        except ValueError as exc:
+            p.error(f"{root}: {exc}")
+    elif a.component == "backend":
         argv, extra = backend(
             root, kind, a.backend_host, a.port or back_port, a.fp8, a.eager
         )
@@ -538,7 +612,8 @@ def main(argv=None):
         if a.max_num_seqs:
             workers = argv[argv.index("--workers") + 1]
             argv = override(argv, "--workers", max(int(workers), a.max_num_seqs))
-    launch_env = {**LAUNCH_ENV, **extra}
+    # The vLLM settings in LAUNCH_ENV do not apply to the MLX backend.
+    launch_env = extra if mlx else {**LAUNCH_ENV, **extra}
     if a.shell:
         print(shlex.join(["env", *(f"{k}={v}" for k, v in launch_env.items()), *argv]))
         return 0

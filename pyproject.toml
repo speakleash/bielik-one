@@ -12,6 +12,11 @@ dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2.9", "huggingface_hub
 
 [project.optional-dependencies]
 vllm = ["vllm==0.32.0"]
+# Apple-silicon backend for adapter packages (bielik-one backend <package> --engine mlx)
+mlx = [
+    "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 test = ["pytest", "safetensors"]
 
 [project.scripts]

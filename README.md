@@ -6,7 +6,7 @@ The API answers four question types about a textual state — `choice`, `noul` (
 
 ## Install
 
-Python 3.12 and an NVIDIA GPU. In a fresh environment:
+Python 3.12 and an NVIDIA GPU (adapter packages also run on Apple silicon, see [Apple silicon (MLX)](#apple-silicon-mlx)). In a fresh environment:
 
 ```bash
 pip install "bielik-one[vllm] @ git+https://github.com/speakleash/bielik-one"
@@ -145,6 +145,22 @@ Decisions use vLLM's own authentication and CORS middleware, including API keys 
 
 Use `GET /v1/systemone/health` as the readiness check of decisions: it answers 200 with the served model names and calibration once decisions work, and 503 (or 500 for a missing setting) with the reason otherwise; it is under `/v1`, so it needs the API key when one is set. vLLM's own `/health` only reports the engine. After deploying, `python scripts/check_middleware.py --url <server> --api-key <key> --model <served name>` checks decisions, the readiness route, authentication and the LoRA and backend-flag filters, and exits non-zero on any failure. vLLM's API key guards only paths under `/v1`: `/invocations`, `/health`, `/metrics` and its other routes stay open, as in plain vLLM, so restrict them in a reverse proxy before exposing the port.
 
+## Apple silicon (MLX)
+
+On a Mac with Apple silicon, adapter packages run on [MLX](https://github.com/ml-explore/mlx) instead of vLLM. As with the vLLM adapter backend, one copy of the base model serves both ordinary chat (adapter off) and the decisions (LoRA and decision heads on), chosen per request:
+
+```bash
+pip install "bielik-one[mlx] @ git+https://github.com/speakleash/bielik-one"
+bielik-one backend speakleash/Bielik-One-4B-r1-Adapter --engine mlx
+bielik-one frontend speakleash/Bielik-One-4B-r1-Adapter
+```
+
+The frontend is the same as for vLLM, and so are the API, the ports and the model names. The backend (`bielik_one/mlx_backend.py`) answers the requests the frontend sends to vLLM: one-token reads under `decision` with the LoRA on and the decision heads (float32) as logits, and generation by the unchanged base model under the base alias (`qwen-base`, `bielik-base`) on `/v1/chat/completions` and `/v1/completions`, streaming or not. The LoRA is not merged into the base weights; it is switched on only while a decision read runs. One forward pass runs at a time; a chat generation releases the GPU between tokens, so decisions are not blocked by a long answer.
+
+The base model is the repository and revision the package pins (`heads.json`, `serving.json`). It is downloaded to the Hugging Face cache, or taken from a local directory with `--base DIR` (for example from `hf download <base repo> --revision <pinned revision> --local-dir DIR`). Its weights, config and tokenizer files are checked against the Hub's checksums of the pinned revision before loading; `--skip-base-check` skips this (offline use), with a warning. `--cache-limit-gb` caps the MLX buffer cache (default 4). `--dry-run`, `--port` and `--backend-host` work as for vLLM; the vLLM options (`--fp8`, `--eager`, `--max-num-seqs`, `--kv-cache-gb`) are refused. Merged packages are not supported by the MLX backend; their weights would need a conversion first.
+
+Pinned versions: `mlx==0.32.4`, `mlx-lm==0.32.2`, bfloat16 weights. On the public Tacit dev items (600 validation-style questions, 4 languages, `choice`/`noul`/`score`, raw probabilities, `read_twice: false`), decisions agreed with the vLLM adapter backend on 99.5% (Bielik-One-4B-r1), 99.3% (11B-v3.0) and 99.5% (11B-v3.1) of questions (a merged MLX conversion: 99.5-99.8%); memory is that of one model (8.2 GiB for 4B, 21.3 GiB for 11B) instead of two. Greedy chat is token-identical to plain `mlx_lm` generation with the base model.
+
 ## Deployment and untrusted text
 
 Both processes bind to `127.0.0.1` by default. `--host` moves only the frontend (typed API and chat proxy); the raw vLLM backend stays on loopback unless you pass `--backend-host`, because it accepts internal decision flags. The separate frontend has no authentication: to expose it, put it behind a reverse proxy that authenticates clients. Requests are limited to 64 questions, 16 permutations, 400,000 characters of state and 400,000 characters of questions. The frontend refuses a body larger than 16 MiB with HTTP 413 before reading it whole (`--max-body-mb` on `bielik-one frontend` changes it); text that is not valid Unicode (a lone UTF-16 surrogate such as `"\udead"`) is refused with 422. Every response carries an `x-request-id` header: the client's `X-Request-Id` when it is 1-128 characters of letters, digits and `._:-`, otherwise a generated one. The frontend logs it with failed requests and sends it, with a suffix per call, to the vLLM backend. If the backend binds a specific address with `--backend-host`, start the frontend with the same `--backend-host` (or `--backend-url`).
@@ -171,7 +187,7 @@ The request options below change the numbers you get, so a result is only meanin
 
 ## Contents
 
-`bielik_one/launch.py` (launcher), `bielik_one/api/` (typed API frontend over a vLLM backend), `bielik_one/prompting/` (prompt rendering), `vllm-heads-plugin/` (`systemone-vllm-heads`, decision heads inside vLLM).
+`bielik_one/launch.py` (launcher), `bielik_one/mlx_backend.py` and `mlx_model.py` (Apple-silicon backend), `bielik_one/api/` (typed API frontend over a vLLM backend), `bielik_one/prompting/` (prompt rendering), `vllm-heads-plugin/` (`systemone-vllm-heads`, decision heads inside vLLM).
 
 ## Tests
 
@@ -179,7 +195,7 @@ The request options below change the numbers you get, so a result is only meanin
 pip install -e ".[test]" && pytest -q
 ```
 
-The tests use synthetic backends and need no GPU.
+The tests use synthetic backends and need no GPU. The MLX tests of the LoRA and head math run only where `mlx` is installed (`pip install -e ".[test,mlx]"` on Apple silicon) and are skipped elsewhere.
 
 ## Contributing
 
