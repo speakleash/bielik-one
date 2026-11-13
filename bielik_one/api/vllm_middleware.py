@@ -293,8 +293,9 @@ def _scrub_sampling_params(raw: bytes) -> bytes:
     params = body.get("sampling_params") if isinstance(body, dict) else None
     if not isinstance(params, dict):
         return raw
-    if params.get("prompt_logprobs") is not None:
-        raise RequestError(["sampling_params", "prompt_logprobs"], "prompt logprobs are not supported by this server")
+    for key in ("prompt_logprobs", "prompt_logprob_token_ids", "prompt_logprob_start"):
+        if params.get(key) is not None:
+            raise RequestError(["sampling_params", key], "prompt logprobs are not supported by this server")
     if "extra_args" not in params:
         return raw
     params.pop("extra_args")
@@ -385,7 +386,8 @@ class SystemOneMiddleware:
         existing = getattr(router, "_systemone_owner", None)
         if existing is not None:
             # Starlette may build the middleware stack more than once (vLLM's SageMaker bootstrap does so before
-            # serving): the routes, engine and state of the first instance stay in charge.
+            # serving): the routes, engine and state of the first instance stay in charge; this instance's
+            # settings/engine arguments are ignored, and nothing is built for it.
             self.owner = existing
             return
         self.owner = self

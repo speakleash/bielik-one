@@ -564,7 +564,8 @@ def test_token_in_requests_cannot_set_backend_flags():
                 "sampling_params": {"max_tokens": 1, "extra_args": {"systemone_head": "base"}}}
         received = client.post("/inference/v1/generate", json=body).json()["received"]
         assert received["sampling_params"] == {"max_tokens": 1}
-        body["sampling_params"] = {"prompt_logprobs": 1}
-        assert client.post("/inference/v1/generate", json=body).status_code == 400
+        for params in ({"prompt_logprobs": 1}, {"prompt_logprob_token_ids": [[1]]}, {"prompt_logprob_start": 0}):
+            body["sampling_params"] = params
+            assert client.post("/inference/v1/generate", json=body).status_code == 400
         body = {"model": "decision", "token_ids": [1]}
         assert client.post("/inference/v1/generate", json=body).status_code == 400
