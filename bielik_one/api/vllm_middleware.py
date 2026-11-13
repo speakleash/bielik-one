@@ -1,4 +1,4 @@
-"""The typed decision API inside `vllm serve`: one process, one port, one public model name.
+"""The typed decision API inside `vllm serve`: one API server, one port, one public model name.
 
     VLLM_PLUGINS=systemone_heads SYSTEMONE_HEADS_MANIFEST=$PKG/heads.json VLLM_USE_V2_MODEL_RUNNER=0 \\
     SYSTEMONE_PACKAGE=$PKG \\
@@ -26,11 +26,11 @@ Environment:
   arrived on, with http://; set it for --uds or TLS).
 - SYSTEMONE_NO_CALIBRATION=1: raw temperature-1 probabilities instead of the package's calibration.json.
 - SYSTEMONE_WORKERS: concurrent backend reads per decision request pool (default 8, the --max-num-seqs profile).
-- SYSTEMONE_MAX_BODY_MB: largest /v1/systemone body (default 16).
+- SYSTEMONE_MAX_BODY_MB: largest decision or public JSON request body (default 16).
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
   --api-server-count > 1 a loopback read can reach another API process, so set one shared value then.
-- VLLM_API_KEY: vLLM's own key variable; when set, /v1/systemone requires it as well and loopback reads send it.
-  `--api-key` on the command line is refused: the middleware cannot read it, so use VLLM_API_KEY.
+- Authentication and CORS: decisions pass through vLLM's own middleware, including API keys from its CLI or
+  configuration file. Loopback reads use a configured server key (VLLM_API_KEY is the fallback).
 
 Created by Filip Reka, filip.reka@cyfronet.pl
 """
@@ -38,14 +38,15 @@ Created by Filip Reka, filip.reka@cyfronet.pl
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import hmac
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
-import sys
 
 DECISION_PATH = "/v1/systemone"
 MODELS_PATH = "/v1/models"
@@ -72,14 +73,8 @@ class Settings:
     max_body_mb: float = 16
 
     @classmethod
-    def from_env(cls, env=None, argv=None) -> "Settings":
+    def from_env(cls, env=None) -> "Settings":
         env = os.environ if env is None else env
-        argv = sys.argv if argv is None else argv
-        if any(arg == "--api-key" or arg.startswith("--api-key=") for arg in argv):
-            raise RuntimeError(
-                "SystemOne middleware: pass the API key as VLLM_API_KEY, not --api-key, "
-                "so that /v1/systemone is protected by it too"
-            )
         package = env.get("SYSTEMONE_PACKAGE")
         if not package:
             raise RuntimeError("SystemOne middleware: set SYSTEMONE_PACKAGE to the adapter package directory")
@@ -101,6 +96,8 @@ class Settings:
             raise RuntimeError("SystemOne middleware: the LoRA name must differ from the public model name")
         if not 1 <= settings.workers <= 256:
             raise RuntimeError("SYSTEMONE_WORKERS must be between 1 and 256")
+        if not math.isfinite(settings.max_body_mb) or settings.max_body_mb * 2**20 < 1:
+            raise RuntimeError("SYSTEMONE_MAX_BODY_MB must be finite and at least one byte")
         return settings
 
 
@@ -141,16 +138,20 @@ def build_engine(settings: Settings):
         headers=headers,
         limits=httpx.Limits(max_connections=settings.workers, max_keepalive_connections=settings.workers),
     )
-    engine = RemoteVllmEngine(
-        metadata,
-        "http://unbound",  # set from the first decision request (or SYSTEMONE_SELF_URL)
-        model_name=settings.public_name or "unbound",
-        backend_model=settings.lora_name,
-        workers=settings.workers,
-        calibration=table,
-        calibration_source=source,
-        client=client,
-    )
+    try:
+        engine = RemoteVllmEngine(
+            metadata,
+            "http://unbound",  # set from the first decision request (or SYSTEMONE_SELF_URL)
+            model_name=settings.public_name or "unbound",
+            backend_model=settings.lora_name,
+            workers=settings.workers,
+            calibration=table,
+            calibration_source=source,
+            client=client,
+        )
+    except BaseException:
+        client.close()
+        raise
     # /v1/systemone answers to the served names only (not "decision" or the reference repo name); they are
     # read from vLLM when the middleware binds, so nothing is accepted before that.
     engine.aliases = set()
@@ -198,6 +199,64 @@ async def _read_body(receive) -> bytes | None:
             return b"".join(parts)
 
 
+def _router(app):
+    """Find vLLM's router below its authentication/CORS middleware stack."""
+    from fastapi import FastAPI
+    from starlette.routing import Router
+
+    seen = set()
+    while app is not None and id(app) not in seen:
+        seen.add(id(app))
+        if isinstance(app, FastAPI):
+            return app.router
+        if isinstance(app, Router):
+            return app
+        app = getattr(app, "app", None)
+    raise RuntimeError("SystemOne middleware requires vLLM's FastAPI router")
+
+
+class _DecisionEndpoint:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def __call__(self, scope, receive, send):
+        return await self.owner._decide(scope, receive, send)
+
+
+class _PublicRoute:
+    """Filter requests after vLLM's auth/CORS, regardless of JSON header spelling."""
+
+    def __init__(self, app, owner):
+        from bielik_one.api.http_guard import guarded
+
+        self.app, self.owner = app, owner
+        self.guarded = guarded(self._filtered, owner.settings.max_body_mb, "openai")
+
+    async def _filtered(self, scope, receive, send):
+        return await self.owner._guarded_post(scope, receive, send, next_app=self.app)
+
+    async def __call__(self, scope, receive, send):
+        if not self.owner._is_internal(scope.get("headers", [])):
+            media = (_header(scope.get("headers", []), b"content-type") or "").split(";", 1)[0].strip().lower()
+            path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
+            if scope.get("method") == "POST" and (
+                media in ("", "application/json") or media.endswith("+json")
+                or path in ("/v1/chat/completions", "/v1/completions", "/v1/responses")
+            ):
+                return await self.guarded(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+class _ModelListRoute:
+    def __init__(self, app, owner):
+        self.app, self.owner = app, owner
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("method") == "GET" and not self.owner._is_internal(scope.get("headers", [])):
+            send = self.owner._models_filter(send)
+        return await self.app(scope, receive, send)
+
+
 class SystemOneMiddleware:
     """ASGI middleware for `vllm serve --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware`."""
 
@@ -206,29 +265,66 @@ class SystemOneMiddleware:
         from bielik_one.api.remote_vllm import build_remote_app
 
         self.app = app
+        router = _router(app)
+        if any(getattr(route, "path", None) == DECISION_PATH for route in router.routes):
+            raise RuntimeError(f"vLLM already defines {DECISION_PATH}; refusing to shadow it")
         self.settings = settings or Settings.from_env()
         self.engine = engine if engine is not None else build_engine(self.settings)
         # Only DECISION_PATH is routed here; the app's chat proxy and health routes are never reached.
-        self.decisions = guarded(build_remote_app(self.engine), self.settings.max_body_mb)
+        self.decision_app = build_remote_app(self.engine)
+        self.decisions = guarded(self.decision_app, self.settings.max_body_mb)
         self.public_names: list[str] = []  # the base model's served names, read from vLLM at bind
         self._bound = False
         self._bind_lock = asyncio.Lock()
         self._internal = self.settings.internal_token.encode()
+        self._api_key = self.settings.api_key
+        self._credentials_configured = False
         self.check_transport = None  # tests: an httpx transport for the startup self-check
+        self._install_routes(router)
+
+    def _install_routes(self, router):
+        from starlette.routing import Route
+
+        # A real route receives the same authentication, CORS, scaling and request-id
+        # middleware as every other vLLM endpoint, including preflight requests.
+        for route in router.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None) or set()
+            if path == MODELS_PATH and "GET" in methods:
+                route.app = _ModelListRoute(route.app, self)
+            elif "POST" in methods:
+                route.app = _PublicRoute(route.app, self)
+        router.routes.append(Route(DECISION_PATH, _DecisionEndpoint(self), methods=["POST"]))
+        original_lifespan = router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(app):
+            async with self.decision_app.router.lifespan_context(self.decision_app):
+                async with original_lifespan(app) as state:
+                    yield state
+
+        # Closing the decision app releases its proxy client and the engine's
+        # HTTP client/thread pool, even when vLLM startup fails.
+        router.lifespan_context = lifespan
+
+    def _configure_credentials(self, scope):
+        if self._credentials_configured:
+            return
+        state = getattr(scope.get("app"), "state", None)
+        args = getattr(state, "args", None)
+        keys = getattr(args, "api_key", None) or [self.settings.api_key]
+        if isinstance(keys, str):
+            keys = [keys]
+        self._api_key = next((key for key in keys if key), None)
+        if self._api_key:
+            self.engine.client.headers["Authorization"] = f"Bearer {self._api_key}"
+        else:
+            self.engine.client.headers.pop("Authorization", None)
+        self._credentials_configured = True
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        headers = scope.get("headers", [])
-        if self._is_internal(headers):
-            return await self.app(scope, receive, send)
-        path, method = scope.get("path", ""), scope.get("method", "")
-        if path == DECISION_PATH:
-            return await self._decide(scope, receive, send)
-        if path == MODELS_PATH and method == "GET":
-            return await self.app(scope, receive, self._models_filter(send))
-        if method == "POST" and (_header(headers, b"content-type") or "").startswith("application/json"):
-            return await self._guarded_post(scope, receive, send)
+        if scope["type"] == "http":
+            self._configure_credentials(scope)
         return await self.app(scope, receive, send)
 
     def _is_internal(self, headers) -> bool:
@@ -242,10 +338,6 @@ class SystemOneMiddleware:
     async def _decide(self, scope, receive, send):
         from bielik_one.api.errors import BACKEND_UNAVAILABLE, INTERNAL_ERROR, error_bytes
 
-        if self.settings.api_key:
-            given = _header(scope.get("headers", []), b"authorization") or ""
-            if not hmac.compare_digest(given.encode(), f"Bearer {self.settings.api_key}".encode()):
-                return await _send_json(send, 401, b'{"error":"Unauthorized"}')
         if not self._bound:
             async with self._bind_lock:
                 if not self._bound:
@@ -279,8 +371,8 @@ class SystemOneMiddleware:
         import httpx
 
         headers = {INTERNAL_HEADER: self.settings.internal_token}
-        if self.settings.api_key:
-            headers["Authorization"] = f"Bearer {self.settings.api_key}"
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         try:
             async with httpx.AsyncClient(timeout=10, trust_env=False, transport=self.check_transport) as client:
                 response = await client.get(url + MODELS_PATH, headers=headers)
@@ -295,6 +387,8 @@ class SystemOneMiddleware:
                 f"vLLM does not serve the decision adapter {lora!r} (served: {served}); start it with "
                 f"--lora-modules {lora}=<package>/adapter, or set SYSTEMONE_LORA_NAME to the name used there"
             )
+        if not any(card.get("id") == lora and card.get("parent") for card in cards):
+            return [], f"{lora!r} is not a LoRA adapter in vLLM's model list"
         names = [card["id"] for card in cards if not card.get("parent") and card.get("id") and card["id"] != lora]
         if not names:
             return [], f"vLLM lists no base model name (served: {served})"
@@ -319,14 +413,15 @@ class SystemOneMiddleware:
         self.engine.backend_url = url
         # Optional reasoning pass: generated by the base model under its served name, through the vLLM routes.
         self.engine.reasoners["original"] = EndpointReasoner(
-            url + "/v1", names[0], key_env="VLLM_API_KEY", tok=getattr(self.engine, "tok", None)
+            url + "/v1", names[0], key_env="VLLM_API_KEY", tok=getattr(self.engine, "tok", None),
+            api_key=self._api_key,
         )
         self._bound = True
         log.info("SystemOne middleware: decisions as %s, read through %s", names, url)
 
     # -- the vLLM routes -----------------------------------------------------------------------------------------
 
-    async def _guarded_post(self, scope, receive, send):
+    async def _guarded_post(self, scope, receive, send, *, next_app):
         """Client JSON requests: the LoRA name, vllm_xargs and prompt logprobs are refused or removed."""
         from bielik_one.api.errors import INVALID_REQUEST, error_bytes
         from bielik_one.api.remote_vllm import public_request_body
@@ -351,7 +446,7 @@ class SystemOneMiddleware:
 
         if body is not raw:
             scope = dict(scope, headers=_with_header(scope["headers"], b"content-length", str(len(body)).encode()))
-        return await self.app(scope, replay, send)
+        return await next_app(scope, replay, send)
 
     def _models_filter(self, send):
         """Leave the LoRA name out of GET /v1/models."""

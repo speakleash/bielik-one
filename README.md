@@ -128,9 +128,25 @@ Free to change for your hardware and load: `--host`, `--port`, `--gpu-memory-uti
 
 The frontend checks every read: a backend started without the required logprob settings is refused with an error instead of returning wrong probabilities. After starting both, `curl <frontend>/health` should report `"status": "ok"` and `"calibrated": true`.
 
+### Single-server middleware (adapter packages)
+
+The middleware contributed by [Filip Reka](https://github.com/FIlipHand) adds `/v1/systemone` to the same vLLM server as chat, without a separate frontend process. It supports `*-Adapter` packages and uses the existing decision engine, calibration and package checks, including weight checksums.
+
+Use a downloaded adapter package and print the validated backend command:
+
+```bash
+export SYSTEMONE_PACKAGE=/path/to/adapter-package
+export SYSTEMONE_LORA_NAME=decision
+bielik-one backend "$SYSTEMONE_PACKAGE" --shell
+```
+
+Run the printed command with `--middleware bielik_one.api.vllm_middleware.SystemOneMiddleware` appended. Keep its printed environment and model/LoRA flags, including `SYSTEMONE_HEADS_MANIFEST`. Do not start `bielik-one frontend` for this mode. Both chat and decisions use the base model's public served name (for example `bielik-base`); the internal `decision` LoRA name is hidden from `/v1/models` and rejected in public generation requests.
+
+Decisions use vLLM's own authentication and CORS middleware, including API keys configured through `--api-key`, its config-file equivalent or `VLLM_API_KEY`. `SYSTEMONE_MAX_BODY_MB` limits decision and public JSON request bodies (default 16 MiB). With multiple API processes, set the same secret `SYSTEMONE_INTERNAL_TOKEN` in each process. For TLS, Unix sockets or a different loopback address, set `SYSTEMONE_SELF_URL` explicitly. See the middleware module's docstring for all settings.
+
 ## Deployment and untrusted text
 
-Both processes bind to `127.0.0.1` by default. `--host` moves only the frontend (typed API and chat proxy); the raw vLLM backend stays on loopback unless you pass `--backend-host`, because it accepts internal decision flags. The API has no authentication: to expose it, put it behind a reverse proxy that authenticates clients. Requests are limited to 64 questions, 16 permutations, 400,000 characters of state and 400,000 characters of questions. The frontend refuses a body larger than 16 MiB with HTTP 413 before reading it whole (`--max-body-mb` on `bielik-one frontend` changes it); text that is not valid Unicode (a lone UTF-16 surrogate such as `"\udead"`) is refused with 422. Every response carries an `x-request-id` header: the client's `X-Request-Id` when it is 1-128 characters of letters, digits and `._:-`, otherwise a generated one. The frontend logs it with failed requests and sends it, with a suffix per call, to the vLLM backend. If the backend binds a specific address with `--backend-host`, start the frontend with the same `--backend-host` (or `--backend-url`).
+Both processes bind to `127.0.0.1` by default. `--host` moves only the frontend (typed API and chat proxy); the raw vLLM backend stays on loopback unless you pass `--backend-host`, because it accepts internal decision flags. The separate frontend has no authentication: to expose it, put it behind a reverse proxy that authenticates clients. Requests are limited to 64 questions, 16 permutations, 400,000 characters of state and 400,000 characters of questions. The frontend refuses a body larger than 16 MiB with HTTP 413 before reading it whole (`--max-body-mb` on `bielik-one frontend` changes it); text that is not valid Unicode (a lone UTF-16 surrogate such as `"\udead"`) is refused with 422. Every response carries an `x-request-id` header: the client's `X-Request-Id` when it is 1-128 characters of letters, digits and `._:-`, otherwise a generated one. The frontend logs it with failed requests and sends it, with a suffix per call, to the vLLM backend. If the backend binds a specific address with `--backend-host`, start the frontend with the same `--backend-host` (or `--backend-url`).
 
 The state, instructions and option texts are data for the model, not instructions to the server. Text that spells a tokenizer control or tag token (for example `<|im_end|>` or `</think>`) is neutralized before tokenization, so it stays plain text and cannot end the user turn; all other text is passed exactly as sent, in the prompt format used in training. A decision about adversarial text (for example a document written to steer the answer) is still a model output about that text, not a guarantee.
 

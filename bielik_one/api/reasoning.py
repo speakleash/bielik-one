@@ -25,11 +25,13 @@ class ReasoningError(RuntimeError):
 
 class EndpointReasoner:
     def __init__(
-        self, url: str, model: str, key_env: str = "REASONING_API_KEY", tok=None
+        self, url: str, model: str, key_env: str = "REASONING_API_KEY", tok=None,
+        api_key: str | None = None,
     ):
         self.url = url.rstrip("/") + "/chat/completions"
         self.model = model
         self.key_env = key_env
+        self.api_key = api_key
         self.tok = tok  # neutralizes client text against this tokenizer's control tokens
 
     def __call__(self, row, max_tokens: int) -> dict:
@@ -40,7 +42,7 @@ class EndpointReasoner:
             "temperature": 0,
         }
         headers = {"Content-Type": "application/json"}
-        key = os.environ.get(self.key_env)
+        key = self.api_key if self.api_key is not None else os.environ.get(self.key_env)
         if key:
             headers["Authorization"] = "Bearer " + key
         # A non-streaming generation sends nothing until it ends: allow for slow decoding of long analyses.
