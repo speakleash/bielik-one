@@ -409,8 +409,10 @@ def test_tls_request_without_self_url_explains_the_setting():
     app, owner, _, _ = make_app()
     owner.check_transport = CountingTransport(owner.check_transport)
     with TestClient(app, base_url="https://testserver") as client:
-        response = client.post("/v1/systemone", json=decision())
-        assert response.status_code == 500 and "SYSTEMONE_SELF_URL" in response.text
+        for _ in range(2):  # a missing setting is answered at once, without retry hints or caching
+            response = client.post("/v1/systemone", json=decision())
+            assert response.status_code == 500 and "SYSTEMONE_SELF_URL" in response.text
+            assert "retry-after" not in response.headers
     assert owner.check_transport.calls == 0
 
 
@@ -461,3 +463,53 @@ def test_build_engine_removes_its_temporary_metadata(tmp_path, monkeypatch):
         engine = middleware.build_engine(middleware.Settings(package=tmp_path, workers=3))
     engine.client.close()
     assert written and not written[0].parent.exists()
+
+
+def test_decision_health_reports_readiness_and_needs_the_key():
+    cards = [{"id": "base-a", "parent": None}]
+    app, _, _, _ = make_app(keys=["key"], cards=cards)
+    auth = {"Authorization": "Bearer key"}
+    with TestClient(app) as client:
+        assert client.get("/v1/systemone/health").status_code == 401
+        response = client.get("/v1/systemone/health", headers=auth)
+        assert response.status_code == 503 and "does not serve the decision adapter" in response.text
+        assert "retry-after" not in response.headers
+        cards.append({"id": "decision", "parent": "base-a"})
+        middleware.BIND_RETRY_SECONDS, saved = 0, middleware.BIND_RETRY_SECONDS
+        try:
+            response = client.get("/v1/systemone/health", headers=auth)
+        finally:
+            middleware.BIND_RETRY_SECONDS = saved
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "models": ["base-a"], "calibrated": True,
+                                   "calibration": "calibration.json"}
+        cards.pop()  # the adapter was unloaded after binding
+        assert client.get("/v1/systemone/health", headers=auth).status_code == 503
+
+
+def test_existing_health_route_is_not_replaced():
+    app = FastAPI()
+    app.add_api_route("/v1/systemone/health", lambda: {"native": True}, methods=["GET"])
+    with patch.object(middleware, "build_engine") as build:
+        with pytest.raises(RuntimeError, match="already defines /v1/systemone/health"):
+            middleware.SystemOneMiddleware(app, settings=middleware.Settings())
+        build.assert_not_called()
+
+
+def test_self_ca_verifies_loopback_reads(tmp_path):
+    import certifi
+    import ssl
+    from bielik_one.api import reasoning
+
+    with pytest.raises(RuntimeError, match="SYSTEMONE_SELF_CA"):
+        middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_SELF_CA": str(tmp_path / "no")})
+    settings = middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_SELF_CA": certifi.where()})
+    context = settings.ssl_context()
+    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
+    assert middleware.Settings().ssl_context() is None
+    app, owner, engine, _ = make_app(self_ca=certifi.where())
+    with TestClient(app) as client:
+        assert client.post("/v1/systemone", json=decision()).status_code == 200
+    reasoner = engine.reasoners["original"]
+    assert reasoner.tls_opener is not None
+    assert reasoning.EndpointReasoner("http://x/v1", "m").tls_opener is None

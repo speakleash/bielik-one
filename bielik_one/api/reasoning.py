@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from bielik_one.prompting.inference import reasoning_messages
 
@@ -26,13 +26,17 @@ class ReasoningError(RuntimeError):
 class EndpointReasoner:
     def __init__(
         self, url: str, model: str, key_env: str = "REASONING_API_KEY", tok=None,
-        api_key: str | None = None,
+        api_key: str | None = None, ssl_context=None,
     ):
         self.url = url.rstrip("/") + "/chat/completions"
         self.model = model
         self.key_env = key_env
         self.api_key = api_key
         self.tok = tok  # neutralizes client text against this tokenizer's control tokens
+        # An operator-configured CA (e.g. a TLS server's own certificate); otherwise the system trust store.
+        self.tls_opener = (
+            None if ssl_context is None else build_opener(ProxyHandler({}), HTTPSHandler(context=ssl_context))
+        )
 
     def __call__(self, row, max_tokens: int) -> dict:
         payload = {
@@ -48,7 +52,7 @@ class EndpointReasoner:
         # A non-streaming generation sends nothing until it ends: allow for slow decoding of long analyses.
         timeout = max(180, 60 + max_tokens / 10)
         try:
-            with _OPENER.open(
+            with (self.tls_opener or _OPENER).open(
                 Request(self.url, data=json.dumps(payload).encode(), headers=headers),
                 timeout=timeout,
             ) as response:

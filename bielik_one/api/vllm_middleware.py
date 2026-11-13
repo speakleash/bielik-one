@@ -13,6 +13,8 @@ Everything a client sees uses vLLM's served model name of the base model (--serv
 argument); the middleware reads it from /v1/models on the first decision request, so nothing has to repeat it:
 - POST /v1/systemone: typed decisions (choice, noul, score, labels) through the decision adapter, answered by the
   same code as `bielik-one frontend` (prompting, chunked logprob reads, calibration, errors);
+- GET /v1/systemone/health: readiness of decisions (200, or 503/500 with the reason): the server's own model list is
+  read and must still contain the decision adapter. vLLM's /health only reports the engine;
 - /v1/chat/completions, /v1/completions and the other vLLM routes: the unchanged base model;
 - GET /v1/models: the decision adapter's LoRA name is left out.
 
@@ -28,7 +30,9 @@ Environment:
   every name vLLM serves the base model under, i.e. all --served-model-name values).
 - SYSTEMONE_LORA_NAME: the adapter's --lora-modules name (default: decision, as printed by `bielik-one backend`).
 - SYSTEMONE_SELF_URL: how this process reaches its own vLLM routes (default: the address the first decision request
-  arrived on, with http://; required for --uds or TLS).
+  arrived on, with http://; required for --uds or TLS, e.g. https://<name in the certificate>:8000).
+- SYSTEMONE_SELF_CA: a CA bundle (PEM) that verifies the TLS certificate of SYSTEMONE_SELF_URL, when it is not
+  signed by a system-trusted CA (proxy and SSL_CERT_FILE variables are ignored for loopback reads).
 - SYSTEMONE_NO_CALIBRATION=1: raw temperature-1 probabilities instead of the package's calibration.json.
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
@@ -37,7 +41,8 @@ Environment:
   --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API
   process, so a shared value is required then (the server refuses to start without it).
 - Authentication and CORS: decisions pass through vLLM's own middleware, including API keys from its CLI or
-  configuration file. Loopback reads use a configured server key (VLLM_API_KEY is the fallback).
+  configuration file. Loopback reads use a configured server key (VLLM_API_KEY is the fallback). vLLM's API key
+  guards only paths under /v1: /invocations, /health, /metrics and the other routes stay open, as in plain vLLM.
 
 Created by Filip Reka, filip.reka@cyfronet.pl
 """
@@ -55,9 +60,11 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import ssl
 import time
 
 DECISION_PATH = "/v1/systemone"
+HEALTH_PATH = "/v1/systemone/health"
 MODELS_PATH = "/v1/models"
 DEFAULT_LORA_NAME = "decision"
 INTERNAL_HEADER = "x-systemone-internal"
@@ -82,6 +89,7 @@ class Settings:
     lora_name: str = DEFAULT_LORA_NAME
     package: Path | None = None
     self_url: str | None = None
+    self_ca: str | None = None  # PEM bundle verifying SYSTEMONE_SELF_URL's certificate
     internal_token: str = field(default_factory=lambda: secrets.token_hex(16))
     shared_token: bool = False  # True when SYSTEMONE_INTERNAL_TOKEN sets one secret for every API process
     api_key: str | None = None
@@ -107,6 +115,7 @@ class Settings:
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
             package=root,
             self_url=(env.get("SYSTEMONE_SELF_URL") or "").rstrip("/") or None,
+            self_ca=env.get("SYSTEMONE_SELF_CA") or None,
             api_key=env.get("VLLM_API_KEY") or None,
             calibration=not _flag(env.get("SYSTEMONE_NO_CALIBRATION")),
             workers=workers,
@@ -117,11 +126,19 @@ class Settings:
             settings.shared_token = True
         if settings.public_name is not None and settings.lora_name == settings.public_name:
             raise RuntimeError("SystemOne middleware: the LoRA name must differ from the public model name")
+        if settings.self_ca is not None and not Path(settings.self_ca).expanduser().is_file():
+            raise RuntimeError(f"SYSTEMONE_SELF_CA={settings.self_ca!r} is not a file")
         if settings.workers is not None and not 1 <= settings.workers <= 256:
             raise RuntimeError("SYSTEMONE_WORKERS must be between 1 and 256")
         if not math.isfinite(settings.max_body_mb) or settings.max_body_mb * 2**20 < 1:
             raise RuntimeError("SYSTEMONE_MAX_BODY_MB must be finite and at least one byte")
         return settings
+
+    def ssl_context(self) -> ssl.SSLContext | None:
+        """The verification context of the loopback reads: the system trust store, or SYSTEMONE_SELF_CA."""
+        if self.self_ca is None:
+            return None
+        return ssl.create_default_context(cafile=str(Path(self.self_ca).expanduser()))
 
 
 def build_engine(settings: Settings):
@@ -167,6 +184,7 @@ def build_engine(settings: Settings):
         timeout=180,
         trust_env=False,  # loopback: ignore HTTP_PROXY
         headers=headers,
+        verify=settings.ssl_context() or True,
         limits=httpx.Limits(max_connections=settings.workers, max_keepalive_connections=settings.workers),
     )
     try:
@@ -255,6 +273,14 @@ class _DecisionEndpoint:
         return await self.owner._decide(scope, receive, send)
 
 
+class _HealthEndpoint:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def __call__(self, scope, receive, send):
+        return await self.owner._health(scope, receive, send)
+
+
 class _PublicRoute:
     """Filter client POST requests after vLLM's auth/CORS, whatever their declared content type.
 
@@ -320,8 +346,9 @@ class SystemOneMiddleware:
 
         self.app = app
         router = _router(app)
-        if any(getattr(route, "path", None) == DECISION_PATH for route in router.routes):
-            raise RuntimeError(f"vLLM already defines {DECISION_PATH}; refusing to shadow it")
+        for path in (DECISION_PATH, HEALTH_PATH):
+            if any(getattr(route, "path", None) == path for route in router.routes):
+                raise RuntimeError(f"vLLM already defines {path}; refusing to shadow it")
         self.settings = settings or Settings.from_env()
         self.engine = engine if engine is not None else build_engine(self.settings)
         # Only the typed decision route: the chat, model and health routes are vLLM's own.
@@ -332,6 +359,7 @@ class SystemOneMiddleware:
         self._bound = False
         self._bind_lock = asyncio.Lock()
         self._bind_failure: tuple[float, int, bytes] | None = None  # (monotonic time, status, error body)
+        self._ssl = self.settings.ssl_context()
         self._internal = self.settings.internal_token.encode()
         self._api_key = self.settings.api_key
         self._credentials_configured = False
@@ -353,6 +381,7 @@ class SystemOneMiddleware:
             elif "POST" in methods:
                 route.app = _PublicRoute(route.app, self)
         router.routes.append(Route(DECISION_PATH, _DecisionEndpoint(self), methods=["POST"]))
+        router.routes.append(Route(HEALTH_PATH, _HealthEndpoint(self), methods=["GET"]))
         original_lifespan = router.lifespan_context
 
         @asynccontextmanager
@@ -409,18 +438,49 @@ class SystemOneMiddleware:
             return self._bind_failure
         return None
 
+    async def _ensure_bound(self, scope):
+        """None once bound, else the failure (time, status, error body) to answer with."""
+        if self._bound:
+            return None
+        failure = self._recent_failure()
+        if failure is None:
+            async with self._bind_lock:
+                # Requests that waited for a failed attempt answer from it instead of probing again.
+                failure = None if self._bound else (self._recent_failure() or await self._try_bind(scope))
+        return failure
+
+    @staticmethod
+    async def _send_failure(send, status: int, body: bytes):
+        # Only an unreachable or not yet ready server is worth retrying; a missing setting needs a restart.
+        retry = [(b"retry-after", str(math.ceil(BIND_RETRY_SECONDS)).encode())] if status == 503 else []
+        return await _send_json(send, status, body, retry)
+
     async def _decide(self, scope, receive, send):
-        if not self._bound:
-            failure = self._recent_failure()
-            if failure is None:
-                async with self._bind_lock:
-                    # Requests that waited for a failed attempt answer from it instead of probing again.
-                    failure = None if self._bound else (self._recent_failure() or await self._try_bind(scope))
-            if failure is not None:
-                _, status, body = failure
-                retry = str(math.ceil(BIND_RETRY_SECONDS)).encode()
-                return await _send_json(send, status, body, [(b"retry-after", retry)])
+        failure = await self._ensure_bound(scope)
+        if failure is not None:
+            return await self._send_failure(send, failure[1], failure[2])
         return await self.decisions(scope, receive, send)
+
+    async def _health(self, scope, receive, send):
+        """Readiness of /v1/systemone: bound, and the decision adapter is still in vLLM's model list."""
+        from bielik_one.api.errors import BACKEND_UNAVAILABLE, error_bytes
+
+        failure = await self._ensure_bound(scope)
+        if failure is None:
+            _, problem = await self._discover(self.engine.backend_url)
+            if problem:
+                log.error("SystemOne middleware: %s", problem)
+                failure = (0.0, 503, error_bytes(503, BACKEND_UNAVAILABLE, problem, path=HEALTH_PATH))
+        if failure is not None:
+            return await _send_json(send, failure[1], failure[2])
+        source = getattr(self.engine, "calibration_source", None)
+        body = {
+            "status": "ok",
+            "models": self.public_names,
+            "calibrated": bool(getattr(self.engine, "temperatures", None)),
+            "calibration": Path(source).name if source else None,
+        }
+        return await _send_json(send, 200, json.dumps(body).encode())
 
     async def _try_bind(self, scope):
         """Bind to this server's model names; on failure, the remembered (time, status, error body)."""
@@ -432,14 +492,15 @@ class SystemOneMiddleware:
                 f"cannot derive this server's own URL from a {scope.get('scheme', 'unknown')!r} request "
                 "(TLS or a Unix socket); set SYSTEMONE_SELF_URL"
             )
-            status, code = 500, INTERNAL_ERROR
-        else:
-            names, problem = await self._discover(url)
-            if not problem:
-                self._bind(url, names)
-                self._bind_failure = None
-                return None
-            status, code = 503, BACKEND_UNAVAILABLE
+            log.error("SystemOne middleware: %s", problem)
+            # A configuration error: answered at once on every request, not remembered as a retryable failure.
+            return (time.monotonic(), 500, error_bytes(500, INTERNAL_ERROR, problem, path=DECISION_PATH))
+        names, problem = await self._discover(url)
+        if not problem:
+            self._bind(url, names)
+            self._bind_failure = None
+            return None
+        status, code = 503, BACKEND_UNAVAILABLE
         log.error("SystemOne middleware: %s", problem)
         self._bind_failure = (time.monotonic(), status, error_bytes(status, code, problem, path=DECISION_PATH))
         return self._bind_failure
@@ -468,7 +529,9 @@ class SystemOneMiddleware:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         try:
-            async with httpx.AsyncClient(timeout=10, trust_env=False, transport=self.check_transport) as client:
+            async with httpx.AsyncClient(
+                timeout=10, trust_env=False, verify=self._ssl or True, transport=self.check_transport
+            ) as client:
                 response = await client.get(url + MODELS_PATH, headers=headers)
                 response.raise_for_status()
                 cards = [card for card in response.json()["data"] if isinstance(card, dict)]
@@ -508,7 +571,7 @@ class SystemOneMiddleware:
         # Optional reasoning pass: generated by the base model under its served name, through the vLLM routes.
         self.engine.reasoners["original"] = EndpointReasoner(
             url + "/v1", names[0], key_env="VLLM_API_KEY", tok=getattr(self.engine, "tok", None),
-            api_key=self._api_key,
+            api_key=self._api_key, ssl_context=self._ssl,
         )
         self._bound = True
         log.info("SystemOne middleware: decisions as %s, read through %s", names, url)
