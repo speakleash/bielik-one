@@ -22,6 +22,7 @@ class FakeRunner:
     """Head logprobs -1.0 per head id, vocabulary logprobs -2.0; generation spells "hello world"."""
 
     generation_defaults = {"temperature": 0.7}
+    vocab_size = 1000
 
     def __init__(self):
         self.calls = []
@@ -103,6 +104,37 @@ class ProtocolTests(unittest.TestCase):
         ):
             self.assertEqual(c.post("/v1/completions", json=body).status_code, 400, body)
         self.assertEqual(c.post("/v1/completions", json=read("other", [7])).status_code, 404)
+
+    def test_token_ids_outside_the_vocabulary_are_refused_before_the_model(self):
+        c, runner = client()
+        for body in (
+            read("decision", [7, 1000]),
+            read("decision", [7, -1]),
+            read("decision", [7], prompt=[5, 1000]),
+            read("qwen-base", [7], prompt=[-3]),
+            {"prompt": [5, 10**12], "max_tokens": 1},
+        ):
+            r = c.post("/v1/completions", json=body)
+            self.assertEqual(r.status_code, 400, body)
+            self.assertIn("out of vocabulary", r.json()["error"]["message"])
+            self.assertEqual(r.json()["error"]["type"], "BadRequestError")
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(c.post("/v1/completions", json=read("decision", [7, 999])).status_code, 200)
+
+    def test_chat_template_kwargs_are_template_variables_only(self):
+        c, runner = client()
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+        for key in ("chat_template", "tokenize", "return_dict", "add_generation_prompt", "continue_final_message",
+                    "tools", "return_tensors"):
+            r = c.post("/v1/chat/completions", json={**body, "chat_template_kwargs": {key: "x"}})
+            self.assertEqual(r.status_code, 400, key)
+            self.assertIn(key, r.json()["error"]["message"])
+        r = c.post("/v1/chat/completions", json={**body, "chat_template_kwargs": ["enable_thinking"]})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(runner.calls, [])
+        r = c.post("/v1/chat/completions", json={**body, "chat_template_kwargs": {"enable_thinking": True}})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(runner.calls[0], ("chat", {"enable_thinking": True}))
 
     def test_chat_is_the_base_model_only(self):
         c, runner = client()

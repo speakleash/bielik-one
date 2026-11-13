@@ -98,8 +98,10 @@ class MlxRunner:
         mx.eval(self.model.parameters())
         base_bytes = mx.get_active_memory()
         modules, lora_bytes = attach_lora(self.model, Path(info["adapter"]), info["rank"])
-        hidden = self.model.model.embed_tokens.weight.shape[1]
+        self.vocab_size, hidden = self.model.model.embed_tokens.weight.shape
         self.heads = Heads(root, hidden)
+        if any(i >= self.vocab_size for i in self.heads.column):
+            raise ValueError("head token ids must be within the model's vocabulary")
         config = base / "generation_config.json"
         generation = json.loads(config.read_text()) if config.is_file() else {}
         self.generation_defaults = {

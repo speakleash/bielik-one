@@ -267,11 +267,39 @@ def token_prompt(prompt) -> bool:
     )
 
 
+def out_of_vocabulary(ids: list[int], vocab_size: int) -> str | None:
+    """vLLM refuses token ids outside the vocabulary (400); here they would index past the embedding."""
+    bad = next((t for t in ids if not 0 <= t < vocab_size), None)
+    return None if bad is None else f"Token id {bad} is out of vocabulary"
+
+
+# apply_chat_template arguments that are not template variables. vLLM drops chat_template and tokenize; the
+# others would change what is rendered or returned, so a request may not set any of them.
+TEMPLATE_CONTROL_KEYS = frozenset({
+    "conversation", "messages", "chat_template", "tools", "documents", "add_generation_prompt",
+    "continue_final_message", "tokenize", "padding", "truncation", "max_length", "return_tensors", "return_dict",
+    "return_assistant_tokens_mask", "tokenizer_kwargs", "processor_kwargs",
+})
+
+
+def template_kwargs(value) -> dict:
+    """chat_template_kwargs of a request: template variables only (e.g. enable_thinking)."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    refused = sorted(set(value) & TEMPLATE_CONTROL_KEYS)
+    if refused:
+        raise ValueError(f"chat_template_kwargs may not set {', '.join(refused)}")
+    return dict(value)
+
+
 def build_app(runner, alias: str, base_row_heads: bool = False):
     """The vLLM routes `bielik-one frontend` uses, over a runner (mlx_model.MlxRunner, or a fake in tests).
 
     A runner provides decision(prompt, ids, adapter), vocab(prompt, ids), encode(text), chat_ids(messages, kwargs),
-    generation_defaults and generate(prompt_ids, params) yielding (text so far, tokens, finish reason, done).
+    vocab_size, generation_defaults and generate(prompt_ids, params) yielding (text so far, tokens, finish reason,
+    done). Every token id from a request is checked against vocab_size before it reaches the runner.
     """
     app = FastAPI(title="bielik-one MLX backend")
     names = [alias, "decision"]
@@ -365,7 +393,12 @@ def build_app(runner, alias: str, base_row_heads: bool = False):
         if not isinstance(messages, list) or not messages:
             return error(400, "messages must be a non-empty list")
         try:
-            ids = runner.chat_ids(messages, dict(body.get("chat_template_kwargs") or {}))
+            kwargs = template_kwargs(body.get("chat_template_kwargs"))
+        except ValueError as exc:
+            return error(400, str(exc))
+        try:
+            # Rendering runs client-controlled Jinja: keep it off the event loop.
+            ids = await run_in_threadpool(runner.chat_ids, messages, kwargs)
         except Exception as exc:  # template errors: the request is the client's to change
             return error(400, f"chat template: {exc}")
         if len(ids) >= MAX_MODEL_LEN:
@@ -389,6 +422,9 @@ def build_app(runner, alias: str, base_row_heads: bool = False):
                 return error(400, "decision reads are one-token reads with logprob_token_ids")
             if len(prompt) >= MAX_MODEL_LEN:
                 return error(400, f"prompt of {len(prompt)} tokens exceeds the context ({MAX_MODEL_LEN})")
+            problem = out_of_vocabulary(prompt, runner.vocab_size) or out_of_vocabulary(ids, runner.vocab_size)
+            if problem:
+                return error(400, problem)
             kind = read_kind(body, alias, base_row_heads)
             if kind == "vocab":
                 values = await run_in_threadpool(runner.vocab, prompt, ids)
@@ -409,8 +445,11 @@ def build_app(runner, alias: str, base_row_heads: bool = False):
             }
         if token_prompt(prompt):
             prompt_ids = list(prompt)
+            problem = out_of_vocabulary(prompt_ids, runner.vocab_size)
+            if problem:
+                return error(400, problem)
         elif isinstance(prompt, str) and prompt:
-            prompt_ids = runner.encode(prompt)
+            prompt_ids = await run_in_threadpool(runner.encode, prompt)
         else:
             return error(400, "prompt must be a string or a list of token ids")
         if len(prompt_ids) >= MAX_MODEL_LEN:
