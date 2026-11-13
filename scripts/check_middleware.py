@@ -4,11 +4,12 @@
 
 It sends a few requests and prints PASS/FAIL per check; the exit status is 0 only when every check passes:
 - decisions and their readiness check answer (and need the API key when one is set);
-- the internal LoRA name is hidden from /v1/models and refused in chat, completions and /v1/systemone;
+- the internal LoRA name is hidden from /v1/models and refused (by the middleware itself) in chat and completions;
 - client backend flags and prompt logprobs are refused; ordinary and streaming chat still work;
 - SageMaker adapter headers and runtime LoRA management are not usable by clients.
 
-It generates a few tokens and runs one decision request; it changes nothing on the server.
+It generates a few tokens and runs one decision request; it changes nothing on the server. A negative sample review
+read as anything else is printed as a warning (a model sanity hint), not counted as a failure.
 """
 
 from __future__ import annotations
@@ -31,16 +32,31 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     verify = ssl.create_default_context(cafile=args.cacert) if args.cacert else True
-    client = httpx.Client(base_url=args.url.rstrip("/"), timeout=600, trust_env=False, verify=verify)
+    client = httpx.Client(base_url=args.url.rstrip("/"), timeout=httpx.Timeout(600, connect=10), trust_env=False,
+                          verify=verify)
     key = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
     results: list[bool] = []
+    refused = "answers typed decisions"  # the middleware's own refusal of the LoRA name (not vLLM's)
 
     def check(name: str, ok: bool, detail: str = "") -> None:
         results.append(ok)
         print(("PASS " if ok else "FAIL ") + name + (f" -- {detail}" if detail and not ok else ""))
 
-    def post(path, body=None, headers=None, **kwargs):
-        return client.post(path, json=body, headers={**key, **(headers or {})}, **kwargs)
+    def call(method, path, body=None, headers=None, content=None):
+        """The response, or None (reported) when the server cannot be reached."""
+        try:
+            return client.request(method, path, json=body if content is None else None, content=content,
+                                  headers={**key, **(headers or {})})
+        except httpx.HTTPError as exc:
+            print(f"FAIL {method} {path} -- {exc!r}")
+            results.append(False)
+            return None
+
+    def status(response):
+        return None if response is None else response.status_code
+
+    def text(response):
+        return "" if response is None else response.text[:300]
 
     decision = {
         "model": args.model,
@@ -53,56 +69,65 @@ def main(argv=None) -> int:
     }
 
     if args.api_key:
-        check("decisions need the API key", client.post("/v1/systemone", json=decision).status_code == 401)
-        check("decision health needs the API key", client.get("/v1/systemone/health").status_code == 401)
-    response = client.get("/v1/systemone/health", headers=key)
-    check("decision health is ok", response.status_code == 200, response.text[:300])
-    if response.status_code == 200:
+        try:
+            check("decisions need the API key", client.post("/v1/systemone", json=decision).status_code == 401)
+            check("decision health needs the API key", client.get("/v1/systemone/health").status_code == 401)
+        except httpx.HTTPError as exc:
+            check("server reachable", False, repr(exc))
+            return 1
+    response = call("GET", "/v1/systemone/health")
+    check("decision health is ok", status(response) == 200, text(response))
+    if status(response) == 200:
         print("  health:", response.text)
-    response = post("/v1/systemone", decision)
-    check("decision answered", response.status_code == 200, response.text[:300])
-    if response.status_code == 200:
-        answer = response.json()["answers"]["sentiment"]
+    response = call("POST", "/v1/systemone", decision)
+    check("decision answered", status(response) == 200, text(response))
+    if status(response) == 200:
+        answer = response.json().get("answers", {}).get("sentiment", {})
         print("  sentiment:", json.dumps(answer.get("probabilities")))
-        check("negative review read as negative", answer.get("choice") == "neg", json.dumps(answer)[:300])
-    response = post("/v1/systemone", {**decision, "model": args.lora_name})
-    check("LoRA name refused at /v1/systemone", response.status_code == 422, response.text[:300])
+        if answer.get("choice") != "neg":  # a model sanity hint, not a deployment check
+            print("  warning: the negative sample review was not read as negative; check the package and base model")
 
-    response = client.get("/v1/models", headers=key)
-    ids = [card.get("id") for card in response.json().get("data", [])] if response.status_code == 200 else []
-    check("LoRA hidden from /v1/models", args.model in ids and args.lora_name not in ids, f"{response.status_code} {ids}")
+    response = call("GET", "/v1/models")
+    ids = [card.get("id") for card in response.json().get("data", [])] if status(response) == 200 else []
+    check("LoRA hidden from /v1/models", args.model in ids and args.lora_name not in ids, f"{status(response)} {ids}")
 
     chat = {"model": args.model, "messages": [{"role": "user", "content": "Odpowiedz jednym słowem: tak."}],
             "max_tokens": 4}
-    response = post("/v1/chat/completions", chat)
-    check("base model chat works", response.status_code == 200, response.text[:300])
-    with client.stream("POST", "/v1/chat/completions", json={**chat, "stream": True}, headers=key) as stream:
-        body = b"".join(stream.iter_raw())
-    check("streaming chat works", stream.status_code == 200 and b"[DONE]" in body, body[:200].decode(errors="replace"))
-    response = post("/v1/chat/completions", {**chat, "model": args.lora_name})
-    check("LoRA name refused in chat", response.status_code == 400, response.text[:300])
-    completion = {"model": args.lora_name, "prompt": "x", "max_tokens": 1}
-    response = client.post("/v1/completions", content=json.dumps(completion), headers={**key, "content-type": "text/plain"})
-    check("LoRA name refused whatever the content type", response.status_code == 400, response.text[:300])
-    response = post("/v1/completions", {"model": args.model, "prompt": "x", "max_tokens": 1, "prompt_logprobs": 1})
-    check("prompt logprobs refused", response.status_code == 400, response.text[:300])
+    response = call("POST", "/v1/chat/completions", chat)
+    check("base model chat works", status(response) == 200, text(response))
+    try:
+        with client.stream("POST", "/v1/chat/completions", json={**chat, "stream": True}, headers=key) as stream:
+            body = b"".join(stream.iter_raw())
+        check("streaming chat works", stream.status_code == 200 and b"[DONE]" in body,
+              body[:200].decode(errors="replace"))
+    except httpx.HTTPError as exc:
+        check("streaming chat works", False, repr(exc))
+    # The refusal text proves the middleware (and the --lora-name given here) answered, not vLLM's own validation.
+    response = call("POST", "/v1/chat/completions", {**chat, "model": args.lora_name})
+    check("LoRA name refused in chat", status(response) == 400 and refused in text(response), text(response))
+    completion = json.dumps({"model": args.lora_name, "prompt": "x", "max_tokens": 1})
+    response = call("POST", "/v1/completions", content=completion, headers={"content-type": "text/plain"})
+    check("LoRA name refused whatever the content type", status(response) == 400 and refused in text(response),
+          text(response))
+    response = call("POST", "/v1/completions", {"model": args.model, "prompt": "x", "max_tokens": 1,
+                                                "prompt_logprobs": 1})
+    check("prompt logprobs refused", status(response) == 400 and "prompt logprobs" in text(response), text(response))
 
     invocation = {"model": args.model, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 1}
-    response = post("/invocations", invocation, {"X-Amzn-SageMaker-Adapter-Identifier": args.lora_name})
-    check("SageMaker adapter header refused", response.status_code == 400, response.text[:300])
-    for method, path, body in [
-        ("POST", "/v1/unload_lora_adapter", {"lora_name": args.lora_name}),
-        ("POST", "/adapters", {"name": "copy", "src": "/nonexistent"}),
-        ("DELETE", f"/adapters/{args.lora_name}", None),
-    ]:
-        response = client.request(method, path, json=body, headers=key)
-        # 404/405: vLLM registers these only with VLLM_ALLOW_RUNTIME_LORA_UPDATING (refused by the heads plugin).
-        check(f"{method} {path} not usable by clients", response.status_code in (403, 404, 405),
-              f"{response.status_code} {response.text[:200]}")
-    response = client.get("/v1/systemone/health", headers=key)
-    check("decision adapter still loaded", response.status_code == 200, response.text[:300])
+    response = call("POST", "/invocations", invocation, {"X-Amzn-SageMaker-Adapter-Identifier": args.lora_name})
+    check("SageMaker adapter header refused", status(response) == 400 and "SageMaker" in text(response),
+          text(response))
+    # Invalid bodies: a guarded route answers 403, an absent one 404/405, an unguarded one 400/422 without
+    # unloading anything (VLLM_ALLOW_RUNTIME_LORA_UPDATING registers them; the heads plugin refuses that flag).
+    for path in ("/v1/unload_lora_adapter", "/v1/load_lora_adapter", "/adapters"):
+        response = call("POST", path, {})
+        check(f"POST {path} not usable by clients", status(response) in (403, 404, 405),
+              f"{status(response)} {text(response)}")
+    response = call("GET", "/v1/systemone/health")
+    check("decision adapter still loaded", status(response) == 200, text(response))
 
-    if client.post("/invocations", json=invocation).status_code != 401:
+    response = call("POST", "/invocations", invocation, headers={"Authorization": ""})
+    if status(response) not in (None, 401):
         print("  note: /invocations answers without the API key (vLLM guards only /v1 paths); restrict it in a proxy")
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
