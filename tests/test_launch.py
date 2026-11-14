@@ -23,25 +23,40 @@ def package(kind, root):
             "rank": 64,
             "kv_cache_memory_bytes": 1,
         }
-        files["heads.json"] = {"base_revision": "r1", "transformer_rank": 64}
+        files["heads.json"] = {"base_revision": "r1", "transformer_rank": 64, "weights_file": "heads.safetensors"}
+        files["adapter/adapter_config.json"] = {"r": 64}
+        weights = ["adapter/adapter_model.safetensors", "heads.safetensors"]
     elif kind == "llama-merged":
         files["serving.json"] = {
             "general_alias": "bielik-general",
             "kv_cache_memory_bytes": 1,
         }
         files["config.json"] = {"architectures": ["LlamaForCausalLM"]}
+        # Sharded, as the published Llama packages are.
+        files["model.safetensors.index.json"] = {"weight_map": {"a": "model-00001.safetensors", "b": "model-00002.safetensors"}}
+        weights = ["model-00001.safetensors", "model-00002.safetensors"]
     elif kind == "qwen-adapter":
-        files["heads.json"] = {"base_revision": "r1"}
-        (root / "adapter_model.safetensors").write_bytes(b"x")
+        files["heads.json"] = {"base_revision": "r1", "weights_file": "heads.safetensors"}
+        files["adapter_config.json"] = {"r": 128}
+        weights = ["adapter_model.safetensors", "heads.safetensors"]
     else:
         files["conversion.json"]["merged_model"] = True
+        files["config.json"] = {"architectures": ["Qwen3_5ForConditionalGeneration"]}
+        weights = ["model.safetensors"]  # a single file; the published package is sharded like Llama's
+    if kind.endswith("merged"):
+        files["tokenizer.json"] = {"model": {}}
+        files["tokenizer_config.json"] = {}
     for name, value in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text(json.dumps(value))
+    for name in weights:
+        if not (root / name).exists():
+            (root / name).write_bytes(b"weights:" + name.encode())
     (root / "calibration.json").write_text("{}")
     sums = {
-        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in root.iterdir()
-        if p.is_file()
+        p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in root.rglob("*")
+        if p.is_file() and p.name != "SHA256SUMS.json"
     }
     (root / "SHA256SUMS.json").write_text(json.dumps(sums))
 
@@ -144,8 +159,8 @@ class LaunchTests(unittest.TestCase):
 
             def resum():
                 sums = {
-                    p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                    for p in root.iterdir()
+                    p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in root.rglob("*")
                     if p.is_file() and p.name != "SHA256SUMS.json"
                 }
                 (root / "SHA256SUMS.json").write_text(json.dumps(sums))
@@ -239,6 +254,162 @@ class LaunchTests(unittest.TestCase):
                 for component in ("backend", "frontend"):
                     with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
                         dry(component, d)
+
+
+def edit_manifest(root, drop=(), **digests):
+    """Rewrite SHA256SUMS.json without the `drop` entries and with any digests given by keyword (dots as `__`)."""
+    sums = json.loads((root / "SHA256SUMS.json").read_text())
+    for name in drop:
+        sums.pop(name)
+    sums.update({name.replace("__", "."): value for name, value in digests.items()})
+    (root / "SHA256SUMS.json").write_text(json.dumps(sums))
+
+
+def resign(root, name):
+    """Re-record the digest of `name` after a test has changed it."""
+    sums = json.loads((root / "SHA256SUMS.json").read_text())
+    sums[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+    (root / "SHA256SUMS.json").write_text(json.dumps(sums))
+
+
+class ManifestCompletenessTests(unittest.TestCase):
+    """A package passes only when every file it ships is listed and its kind's runtime files are among them."""
+
+    def refused(self, d, pattern):
+        for component in ("backend", "frontend"):
+            with self.assertRaisesRegex(ValueError, pattern):
+                dry(component, d)
+
+    def test_empty_or_malformed_manifest_is_refused(self):
+        for kind in launch.PORTS:
+            for manifest in ("{}", "[]", '"x"'):
+                with self.subTest(kind=kind, manifest=manifest), tempfile.TemporaryDirectory() as d:
+                    package(kind, Path(d))
+                    (Path(d) / "SHA256SUMS.json").write_text(manifest)
+                    self.refused(d, "must be a non-empty object")
+
+    def test_malformed_digest_is_refused(self):
+        for digest in ("0" * 63, "0" * 64 + "0", "G" * 64, "A" * 64, 5, None):
+            with self.subTest(digest=digest), tempfile.TemporaryDirectory() as d:
+                package("llama-merged", Path(d))
+                edit_manifest(Path(d), config__json=digest)
+                self.refused(d, "Invalid SHA-256 digest")
+
+    def test_shipped_file_without_an_entry_is_refused(self):
+        # The file is on disk but its entry is gone: today it would be loaded unverified.
+        cases = {
+            "llama-merged": ["config.json", "tokenizer.json", "model-00001.safetensors", "model.safetensors.index.json"],
+            "qwen-merged": ["config.json", "tokenizer_config.json", "model.safetensors"],
+            "llama-adapter": ["serving.json", "heads.json", "heads.safetensors", "adapter/adapter_model.safetensors",
+                              "adapter/adapter_config.json", "calibration.json"],
+            "qwen-adapter": ["heads.json", "heads.safetensors", "adapter_model.safetensors", "adapter_config.json"],
+        }
+        for kind, names in cases.items():
+            for name in names:
+                with self.subTest(kind=kind, file=name), tempfile.TemporaryDirectory() as d:
+                    package(kind, Path(d))
+                    edit_manifest(Path(d), drop=[name])
+                    self.refused(d, f"Not listed in SHA256SUMS.json: {name}")
+
+    def test_required_file_missing_from_package_and_manifest_is_refused(self):
+        cases = {
+            "llama-merged": ["config.json", "tokenizer.json", "model-00002.safetensors"],
+            "qwen-merged": ["config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"],
+            "llama-adapter": ["heads.safetensors", "adapter/adapter_model.safetensors", "adapter/adapter_config.json"],
+            "qwen-adapter": ["heads.safetensors", "adapter_config.json"],
+        }
+        for kind, names in cases.items():
+            for name in names:
+                with self.subTest(kind=kind, file=name), tempfile.TemporaryDirectory() as d:
+                    package(kind, Path(d))
+                    (Path(d) / name).unlink()
+                    edit_manifest(Path(d), drop=[name])
+                    self.refused(d, f"Required files not listed in SHA256SUMS.json for a {kind} package: .*{name}")
+
+    def test_conversion_metadata_is_required(self):
+        with tempfile.TemporaryDirectory() as d:
+            package("qwen-merged", Path(d))
+            (Path(d) / "conversion.json").unlink()
+            edit_manifest(Path(d), drop=["conversion.json"])
+            self.refused(d, "Required file not listed in SHA256SUMS.json: conversion.json")
+
+    def test_unsharded_merged_package_needs_its_single_weights_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            package("llama-merged", root)
+            for name in ("model.safetensors.index.json", "model-00001.safetensors", "model-00002.safetensors"):
+                (root / name).unlink()
+            edit_manifest(root, drop=["model.safetensors.index.json", "model-00001.safetensors", "model-00002.safetensors"])
+            self.refused(d, "Required files .*model.safetensors")
+            (root / "model.safetensors").write_bytes(b"weights")
+            resign(root, "model.safetensors")
+            self.assertEqual(dry("backend", d)["kind"], "llama-merged")
+
+    def test_index_without_weight_map_or_with_an_escaping_shard_is_refused(self):
+        for index, pattern in (({}, "no weight_map"), ({"weight_map": {"a": "../x.safetensors"}}, "Invalid checksum path")):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                package("llama-merged", root)
+                (root / "model.safetensors.index.json").write_text(json.dumps(index))
+                resign(root, "model.safetensors.index.json")
+                self.refused(d, pattern)
+
+    def test_heads_without_weights_file_is_refused(self):
+        for kind in ("llama-adapter", "qwen-adapter"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                package(kind, root)
+                heads = json.loads((root / "heads.json").read_text())
+                del heads["weights_file"]
+                (root / "heads.json").write_text(json.dumps(heads))
+                resign(root, "heads.json")
+                self.refused(d, "heads.json must name its weights_file")
+
+    def test_heads_digests_must_match_the_manifest_for_both_adapter_layouts(self):
+        adapter = {"llama-adapter": "adapter/adapter_model.safetensors", "qwen-adapter": "adapter_model.safetensors"}
+        for kind, adapter_file in adapter.items():
+            for field, name in (("weights_sha256", "heads.safetensors"), ("adapter_sha256", adapter_file)):
+                with self.subTest(kind=kind, field=field), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    package(kind, root)
+                    heads = json.loads((root / "heads.json").read_text())
+                    sums = json.loads((root / "SHA256SUMS.json").read_text())
+                    heads.update(weights_sha256=sums["heads.safetensors"], adapter_sha256=sums[adapter_file])
+                    (root / "heads.json").write_text(json.dumps(heads))
+                    resign(root, "heads.json")
+                    self.assertEqual(dry("backend", d)["kind"], kind)  # consistent digests pass
+                    heads[field] = "0" * 64
+                    (root / "heads.json").write_text(json.dumps(heads))
+                    resign(root, "heads.json")
+                    self.refused(d, f"Manifest mismatch: {name}")
+
+    def test_hidden_hugging_face_metadata_is_ignored(self):
+        for kind in launch.PORTS:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                package(kind, root)
+                for name in (".cache/huggingface/download/config.json.metadata", ".eval_results/typed-decisions.yaml",
+                             ".DS_Store"):
+                    (root / name).parent.mkdir(parents=True, exist_ok=True)
+                    (root / name).write_text("not part of the package")
+                for component in ("backend", "frontend"):
+                    self.assertEqual(dry(component, d)["kind"], kind)
+
+    def test_unlisted_extra_runtime_file_is_refused(self):
+        for name in ("generation_config.json", "special_tokens_map.json", "model-00003.safetensors", "adapter/extra.bin"):
+            with self.subTest(file=name), tempfile.TemporaryDirectory() as d:
+                package("llama-adapter", Path(d))
+                (Path(d) / name).parent.mkdir(parents=True, exist_ok=True)
+                (Path(d) / name).write_text("{}")
+                self.refused(d, f"Not listed in SHA256SUMS.json: {name}")
+
+    def test_middleware_package_check_uses_the_same_rules(self):
+        with tempfile.TemporaryDirectory() as d:
+            package("qwen-adapter", Path(d))
+            launch.verify(Path(d))
+            (Path(d) / "SHA256SUMS.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "must be a non-empty object"):
+                launch.verify(Path(d))
 
 
 if __name__ == "__main__":

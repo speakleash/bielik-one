@@ -73,17 +73,71 @@ def resolve_package(spec: str, revision: str | None = None) -> Path:
     raise ValueError(f"{spec}: not a package directory or a Hugging Face repo id")
 
 
+def _package_path(name) -> PurePosixPath:
+    """A file named by a manifest: relative, inside the package. Checked by name, not by resolving: HF cache snapshots
+    are symlinks into blobs/."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("Invalid checksum path")
+    pure = PurePosixPath(name)
+    if pure.is_absolute() or "\\" in name or ".." in pure.parts:
+        raise ValueError("Invalid checksum path")
+    return pure
+
+
+def _shipped_files(root: Path) -> set[str]:
+    """Every file in the package that must be listed: all of them except SHA256SUMS.json, the root-level auxiliary
+    files, and hidden paths (Hugging Face metadata such as .cache/ from --local-dir or .eval_results/)."""
+    shipped = set()
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if any(part.startswith(".") for part in relative.parts) or not path.is_file():
+            continue
+        name = relative.as_posix()
+        if name != "SHA256SUMS.json" and name not in NON_RUNTIME_FILES:
+            shipped.add(name)
+    return shipped
+
+
+def _required_files(root: Path, kind: str, heads: dict | None) -> set[str]:
+    """Files the package kind cannot run without; each must have a manifest entry."""
+    required = {"conversion.json"}
+    if kind.startswith("llama"):
+        required.add("serving.json")
+    if kind.endswith("merged"):
+        required |= {"config.json", "tokenizer.json", "tokenizer_config.json"}
+        index = root / "model.safetensors.index.json"
+        if index.is_file():
+            required.add(index.name)
+            weight_map = json.loads(index.read_text()).get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError("model.safetensors.index.json has no weight_map")
+            required |= {_package_path(name).as_posix() for name in weight_map.values()}
+        else:
+            required.add("model.safetensors")
+    else:
+        adapter = "adapter/" if kind == "llama-adapter" else ""
+        required |= {"heads.json", f"{adapter}adapter_config.json", f"{adapter}adapter_model.safetensors"}
+        if heads is not None:
+            weights_file = heads.get("weights_file")
+            if not isinstance(weights_file, str):
+                raise ValueError("heads.json must name its weights_file")
+            required.add(_package_path(weights_file).as_posix())
+    return required
+
+
 def verify(root: Path) -> dict:
-    """Verify runtime files and all weights; ignore only known root-level auxiliary files."""
+    """Verify the package against SHA256SUMS.json: every listed file must match, every file the package ships must be
+    listed (except the root-level auxiliary files), and the files its kind needs to run must be among them."""
     path = root / "SHA256SUMS.json"
     if not path.is_file():
         raise ValueError("SHA256SUMS.json is missing; download the complete repository")
     sums = json.loads(path.read_text())
+    if not isinstance(sums, dict) or not sums:
+        raise ValueError("SHA256SUMS.json must be a non-empty object of file names and SHA-256 digests")
     for relative, expected in sums.items():
-        # Checked by name, not by resolving: HF cache snapshots are symlinks into blobs/.
-        pure = PurePosixPath(relative)
-        if pure.is_absolute() or "\\" in relative or ".." in pure.parts:
-            raise ValueError("Invalid checksum path")
+        pure = _package_path(relative)
+        if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+            raise ValueError(f"Invalid SHA-256 digest for {relative} in SHA256SUMS.json")
         if pure.as_posix() in NON_RUNTIME_FILES:
             continue
         target = root / pure
@@ -98,13 +152,26 @@ def verify(root: Path) -> dict:
         raise ValueError(
             "chat_template.jinja is not part of this package (not in SHA256SUMS.json); remove it"
         )
-    if (root / "heads.json").is_file():
-        heads = json.loads((root / "heads.json").read_text())
-        for name, field in [
-            ("heads.safetensors", "weights_sha256"),
-            ("adapter/adapter_model.safetensors", "adapter_sha256"),
-        ]:
-            if field in heads and name in sums and sums[name] != heads[field]:
+    unlisted = sorted(_shipped_files(root) - set(sums))
+    if unlisted:
+        raise ValueError(
+            f"Not listed in SHA256SUMS.json: {', '.join(unlisted[:5])}"
+            + (f" and {len(unlisted) - 5} more" if len(unlisted) > 5 else "")
+            + "; remove files that are not part of the package"
+        )
+    if "conversion.json" not in sums:
+        raise ValueError("Required file not listed in SHA256SUMS.json: conversion.json")
+    kind = detect(root)
+    adapter_kind = kind.endswith("adapter")
+    heads = json.loads((root / "heads.json").read_text()) if adapter_kind and "heads.json" in sums else None
+    missing = sorted(_required_files(root, kind, heads) - set(sums))
+    if missing:
+        raise ValueError(f"Required files not listed in SHA256SUMS.json for a {kind} package: {', '.join(missing)}")
+    if heads is not None:
+        # heads.json records the digests of the files it was exported with; the manifest must agree.
+        adapter = "adapter/adapter_model.safetensors" if kind == "llama-adapter" else "adapter_model.safetensors"
+        for name, field in [(heads["weights_file"], "weights_sha256"), (adapter, "adapter_sha256")]:
+            if field in heads and sums.get(name) != heads[field]:
                 raise ValueError(f"Manifest mismatch: {name}")
     return sums
 
