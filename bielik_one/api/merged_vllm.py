@@ -7,6 +7,7 @@ import httpx, uvicorn
 from bielik_one.api.remote_vllm import (
     RemoteVllmEngine,
     add_calibration_arguments,
+    add_limit_arguments,
     build_remote_app,
     package_dir,
     resolve_calibration,
@@ -109,6 +110,7 @@ def main():
     p.add_argument("--base-model", default="qwen-general")
     add_calibration_arguments(p)
     add_guard_arguments(p)
+    add_limit_arguments(p)
     a = p.parse_args()
     meta = json.loads(a.metadata.read_text())
     meta["base_snapshot"] = str(package_dir(a.metadata, "tokenizer_config.json"))
@@ -131,6 +133,8 @@ def main():
         workers=a.workers,
         calibration=table,
         calibration_source=source,
+        max_request_tokens=a.max_request_tokens,
+        request_timeout=a.request_timeout,
     )
     # Reasoning must use the same chat-token mask as ordinary chat, not the
     # unmasked raw backend. FastAPI evaluation runs outside the event loop.

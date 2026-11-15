@@ -461,6 +461,19 @@ def main(argv=None):
         help="frontend: largest request body in MiB, larger ones get HTTP 413 (default: 16)",
     )
     p.add_argument(
+        "--max-request-tokens",
+        type=int,
+        metavar="N",
+        help="frontend: prompt tokens one decision request may send in all; larger ones get HTTP 422 "
+        "(default: 4194304)",
+    )
+    p.add_argument(
+        "--request-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="frontend: time one decision request may spend on its reads; slower ones get HTTP 504 (default: 600)",
+    )
+    p.add_argument(
         "--error-format",
         choices=["default", "openai"],
         help='frontend: error bodies {"error", "code"} (default) or in the OpenAI format',
@@ -493,6 +506,10 @@ def main(argv=None):
         p.error("--kv-cache-gb must be positive")
     if a.max_body_mb is not None and not (math.isfinite(a.max_body_mb) and a.max_body_mb * 2**20 >= 1):
         p.error("--max-body-mb must be a finite size of at least one byte")
+    if a.max_request_tokens is not None and a.max_request_tokens < 1:
+        p.error("--max-request-tokens must be at least 1")
+    if a.request_timeout is not None and not (math.isfinite(a.request_timeout) and a.request_timeout > 0):
+        p.error("--request-timeout must be a finite number of seconds greater than 0")
     try:
         root = resolve_package(a.package, a.revision)
     except ValueError as exc:
@@ -535,6 +552,10 @@ def main(argv=None):
             argv += ["--max-body-mb", str(a.max_body_mb)]
         if a.error_format is not None:
             argv += ["--error-format", a.error_format]
+        if a.max_request_tokens is not None:
+            argv += ["--max-request-tokens", str(a.max_request_tokens)]
+        if a.request_timeout is not None:
+            argv += ["--request-timeout", str(a.request_timeout)]
         if a.max_num_seqs:
             workers = argv[argv.index("--workers") + 1]
             argv = override(argv, "--workers", max(int(workers), a.max_num_seqs))
