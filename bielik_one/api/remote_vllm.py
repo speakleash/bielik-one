@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 import contextvars
 import json
 import math
+import sys
 from pathlib import Path
 
 import httpx
@@ -29,7 +30,7 @@ from bielik_one.api.errors import (
     TIMEOUT,
     error_response,
 )
-from bielik_one.api.http_guard import add_guard_arguments, backend_request_id, guarded
+from bielik_one.api.http_guard import add_guard_arguments, backend_request_id, exposure_warning, guarded
 from bielik_one.api.reasoning import ReasoningError
 from bielik_one.prompting.inference import inference_ids
 from bielik_one.prompting.letter import answer_token_ids
@@ -663,6 +664,8 @@ def main():
     engine.reasoners["original"] = EndpointReasoner(
         args.backend_url + "/v1", args.base_model, tok=getattr(engine, "tok", None)
     )
+    if warning := exposure_warning(args.host):
+        print(warning, file=sys.stderr, flush=True)
     uvicorn.run(
         guarded(
             build_remote_app(engine, chat_model=args.base_model, error_format=args.error_format),

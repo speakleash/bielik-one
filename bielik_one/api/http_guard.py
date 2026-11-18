@@ -140,6 +140,20 @@ class RequestGuard:
         await send({"type": "http.response.body", "body": body})
 
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def exposure_warning(host: str) -> str | None:
+    """What a frontend should say when it listens beyond loopback: it has no authentication and no TLS of its own."""
+    if host in LOOPBACK_HOSTS:
+        return None
+    return (
+        f"WARNING: the decision API and the chat proxy listen on {host} with no authentication and no TLS. Any "
+        "client that can reach this address can use them. Expose them only through a reverse proxy that "
+        "authenticates clients and terminates TLS; see docs/deployment.md and deploy/nginx/."
+    )
+
+
 def max_body_mb(text: str) -> float:
     """argparse type: a finite size of at least one byte."""
     import argparse
