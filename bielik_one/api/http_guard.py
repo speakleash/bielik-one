@@ -28,6 +28,22 @@ class _Disconnected(Exception):
     """The client went away before its body was read whole."""
 
 
+def loggable(value) -> str:
+    """Client text for one log line. The ASGI path is percent-decoded, so a request for /x%0aFORGED would otherwise
+    start a second, made-up line; control and other non-printable characters (CR, LF, ESC, U+2028, ...) are written as
+    escapes instead, and backslashes are doubled so an escape in the log always means the character was there."""
+    out = []
+    for char in str(value):
+        if char == "\\":
+            out.append("\\\\")
+        elif char.isprintable():
+            out.append(char)
+        else:
+            code = ord(char)
+            out.append(f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}")
+    return "".join(out)
+
+
 def request_id_from(headers) -> str:
     for key, value in headers:
         if key.lower() == b"x-request-id":
@@ -91,7 +107,11 @@ class RequestGuard:
             # One line per failed request, with its id; the traceback of an unhandled error is uvicorn's.
             if status is None or status >= 500:
                 log.warning(
-                    "request %s %s %s answered %s", rid, scope.get("method"), scope.get("path"), status or "nothing"
+                    "request %s %s %s answered %s",
+                    rid,
+                    loggable(scope.get("method")),
+                    loggable(scope.get("path")),
+                    status or "nothing",
                 )
             REQUEST_ID.reset(token)
 
