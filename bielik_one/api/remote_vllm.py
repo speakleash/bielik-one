@@ -7,6 +7,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import contextvars
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -427,10 +428,141 @@ class RemoteVllmEngine(LetterEngine):
         return super().evaluate(body)
 
 
+# What one public generation request (chat, completions, responses, messages) may ask vLLM to produce. vLLM itself
+# accepts n up to 16384 and up to 1024 prompts per completions request, each answer running to the end of the context
+# when max_tokens is not set.
+DEFAULT_MAX_GENERATION_N = 16
+DEFAULT_MAX_GENERATION_TOKENS = 131_072  # four full answers at the 32k context of every launcher profile
+CONTEXT_TOKENS = 32768  # --max-model-len of the launcher profiles: how long an answer without max_tokens can run
+
+
+@dataclass(frozen=True)
+class GenerationLimits:
+    """Per-request budget for public generation. None lifts a limit."""
+
+    max_n: int | None = DEFAULT_MAX_GENERATION_N
+    max_tokens: int | None = DEFAULT_MAX_GENERATION_TOKENS
+    context_tokens: int = CONTEXT_TOKENS
+
+
+def _count(value) -> int | None:
+    """A count or token limit as vLLM's request models would read it. Pydantic coerces "8", 8.0 and true to ints, so
+    those count too; fractions are rounded up, so nothing is counted lower than vLLM could use it."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return math.ceil(value)
+    return None
+
+
+# Which limit field each route reads, as vLLM 0.32 does: a reading is the fields tried in order, the first one set
+# wins, and an answer with none of them set runs to the end of the context. Chat prefers max_completion_tokens.
+_CHAT = ("max_completion_tokens", "max_tokens")
+ROUTE_READINGS = {
+    "/v1/completions": (("max_tokens",),),
+    "/v1/chat/completions": (_CHAT,),
+    "/v1/chat/completions/batch": (_CHAT,),
+    "/v1/responses": (("max_output_tokens",),),
+    "/v1/messages": (("max_tokens",),),
+}
+# Any other route (for example /invocations, which picks the handler from the body): the costliest of the readings.
+ANY_READING = (_CHAT, ("max_tokens",), ("max_output_tokens",))
+
+
+# vLLM routes that never generate output tokens (tokenization, rendering, scoring with max_tokens=1, embeddings,
+# pooling, reranking, status and admin calls): the budget does not apply to them.
+NON_GENERATION_ROUTES = (
+    "/tokenize", "/detokenize", "/v1/messages/count_tokens", "/generative_scoring",
+    "/v1/chat/completions/render", "/v1/chat/completions/derender", "/v1/completions/render",
+    "/v1/completions/derender", "/v1/messages/render", "/v1/responses/render",
+    "/v1/embeddings", "/v2/embed", "/pooling", "/classify", "/score", "/v1/score", "/rerank", "/v1/rerank", "/v2/rerank",
+    "/ping", "/is_scaling_elastic_ep",
+)
+# On a route the filter knows nothing about, a body that asks for none of these is not a generation request.
+GENERATION_FIELDS = ("prompt", "messages", "input", "token_ids", "sampling_params", "n", "best_of", *(
+    "max_completion_tokens", "max_tokens", "max_output_tokens"))
+
+
+def _on(route: str, path: str) -> bool:
+    """route is path, possibly behind a root path."""
+    return route == path or route.endswith(path) and route[: -len(path)].startswith("/")
+
+
+def generates(route: str | None, body: dict) -> bool:
+    """Whether the generation budget applies to this request."""
+    if route and any(_on(route, path) for path in NON_GENERATION_ROUTES):
+        return False
+    if route and any(_on(route, path) for path in ROUTE_READINGS) or route and _on(route, "/inference/v1/generate"):
+        return True
+    return any(field in body for field in GENERATION_FIELDS)
+
+
+def _readings(route: str | None) -> tuple[tuple[str, ...], ...]:
+    if route:
+        for path, readings in ROUTE_READINGS.items():
+            if _on(route, path):
+                return readings
+    return ANY_READING
+
+
+def check_generation_budget(
+    body: dict, limits: GenerationLimits, route: str | None = None, loc: tuple[str, ...] = ()
+) -> None:
+    """Refuse a request that asks for more answers, or more output tokens in all, than the limits allow.
+
+    The cost counted is prompts x answers per prompt x tokens per answer. Prompts are the longer of a completions
+    prompt list and a batch chat's list of conversations (vLLM ignores the field its route does not use, so neither
+    may lower the count). n, or best_of (also the beam width for beam search), multiplies each. Tokens per answer come
+    from the field the route reads (`route` is the request path), and are the full context when that field is not
+    set; for a route not listed, the costliest reading counts. Token-in requests carry these fields in
+    sampling_params, which is checked the same way.
+    """
+    n = _count(body.get("n")) or 1
+    best_of = _count(body.get("best_of")) or 0
+    width, width_field = (best_of, "best_of") if best_of > n else (n, "n")
+    if limits.max_n is not None and width > limits.max_n:
+        raise RequestError([*loc, width_field], f"{width_field} is {width}; this server allows at most {limits.max_n}")
+    prompts = 1
+    prompt = body.get("prompt")
+    if isinstance(prompt, list) and prompt and not all(isinstance(token, int) for token in prompt):
+        prompts = len(prompt)  # several prompts (text or token lists), not one prompt given as token ids
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages and all(isinstance(m, list) for m in messages):
+        prompts = max(prompts, len(messages))  # /v1/chat/completions/batch: one answer per conversation
+    costs = []  # (tokens per answer, field named in an error, whether it was unset)
+    for reading in (("max_tokens",),) if loc else _readings(route):
+        found = next(((v, name) for name in reading if (v := _count(body.get(name))) is not None and v >= 1), None)
+        if found is None:
+            costs.append((limits.context_tokens, reading[-1], True))
+        else:
+            costs.append((min(found[0], limits.context_tokens), found[1], False))
+    per_answer, field, unset = max(costs)
+    total = prompts * width * per_answer
+    if limits.max_tokens is not None and total > limits.max_tokens:
+        unit = f"{per_answer} tokens each" + (f" ({field} not set)" if unset else "")
+        raise RequestError(
+            [*loc, field],
+            f"this request asks for up to {total} output tokens ({prompts} prompt(s) x {width} answer(s) x {unit}); "
+            f"this server allows at most {limits.max_tokens} per request. Set {field} or ask for fewer answers",
+        )
+    if not loc and isinstance(body.get("sampling_params"), dict):
+        check_generation_budget(body["sampling_params"], limits, route, ("sampling_params",))
+
+
 def public_request_body(
-    raw: bytes, decision_models=frozenset(), chat_model: str | None = None
+    raw: bytes,
+    decision_models=frozenset(),
+    chat_model: str | None = None,
+    limits: GenerationLimits = GenerationLimits(),
+    route: str | None = None,
 ) -> bytes:
-    """Ordinary chat/completion requests from clients: drop internal decision flags; reject prompt logprobs.
+    """Ordinary chat/completion requests from clients: drop internal decision flags; reject prompt logprobs and
+    requests over the generation budget.
 
     vllm_xargs could switch rows to decision heads; prompt logprobs and echo+logprobs are not supported by the
     decision-head backend. The decision model names are rejected: they answer typed questions at /v1/systemone,
@@ -462,6 +594,8 @@ def public_request_body(
         raise RequestError(
             ["prompt_logprobs"], "prompt logprobs are not supported by this server"
         )
+    if generates(route, body):
+        check_generation_budget(body, limits, route)
     if "vllm_xargs" in body:
         body.pop("vllm_xargs")
         changed = True
@@ -494,7 +628,10 @@ def install_backend_errors(app, error_format: str = "default"):
 
 
 def build_remote_app(
-    engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default"
+    engine: RemoteVllmEngine,
+    chat_model: str | None = None,
+    error_format: str = "default",
+    generation_limits: GenerationLimits | None = None,
 ):
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from starlette.background import BackgroundTask
@@ -558,10 +695,12 @@ def build_remote_app(
             content, status_code=response.status_code, media_type="application/json"
         )
 
+    limits = generation_limits or GenerationLimits(context_tokens=getattr(engine, "max_model_len", CONTEXT_TOKENS))
+
     async def forward(request: Request):
         try:
             body = public_request_body(
-                await request.body(), engine.aliases, chat_model
+                await request.body(), engine.aliases, chat_model, limits, request.url.path
             )
         except RequestError as exc:
             return failure(request, 400, INVALID_REQUEST, exc.msg)
@@ -625,6 +764,40 @@ def add_calibration_arguments(parser):
     )
 
 
+def _positive_int_or_none(text: str) -> int | None:
+    """argparse type: a whole number of at least 1, or "none" to lift the limit."""
+    if text.strip().lower() == "none":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 (or none)")
+    return value
+
+
+def add_generation_arguments(parser):
+    parser.add_argument(
+        "--max-generation-n",
+        type=_positive_int_or_none,
+        default=DEFAULT_MAX_GENERATION_N,
+        help="largest n (or best_of, the beam width) one chat/completions request may ask for; "
+        f"'none' lifts it (default: {DEFAULT_MAX_GENERATION_N})",
+    )
+    parser.add_argument(
+        "--max-generation-tokens",
+        type=_positive_int_or_none,
+        default=DEFAULT_MAX_GENERATION_TOKENS,
+        help="output tokens one chat/completions request may ask for in all (prompts x n x max_tokens, an unset "
+        f"max_tokens counting as the full context); 'none' lifts it (default: {DEFAULT_MAX_GENERATION_TOKENS})",
+    )
+
+
+def generation_limits(args, context_tokens: int = CONTEXT_TOKENS) -> GenerationLimits:
+    return GenerationLimits(args.max_generation_n, args.max_generation_tokens, context_tokens)
+
+
 def main():
     import uvicorn
     from bielik_one.api.reasoning import EndpointReasoner
@@ -642,6 +815,7 @@ def main():
     )
     add_calibration_arguments(parser)
     add_guard_arguments(parser)
+    add_generation_arguments(parser)
     args = parser.parse_args()
     metadata = json.loads(args.metadata.read_text())
     table, source = resolve_calibration(
@@ -665,7 +839,10 @@ def main():
     )
     uvicorn.run(
         guarded(
-            build_remote_app(engine, chat_model=args.base_model, error_format=args.error_format),
+            build_remote_app(
+                engine, chat_model=args.base_model, error_format=args.error_format,
+                generation_limits=generation_limits(args, getattr(engine, "max_model_len", CONTEXT_TOKENS)),
+            ),
             args.max_body_mb,
             args.error_format,
         ),

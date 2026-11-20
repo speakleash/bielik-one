@@ -41,6 +41,10 @@ Environment:
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
 - SYSTEMONE_MAX_BODY_MB: largest decision or public request body (default 16); form uploads are not limited here.
+- SYSTEMONE_MAX_GENERATION_N: largest n (or best_of) a public generation request may ask for (default 16; "none"
+  lifts it). SYSTEMONE_MAX_GENERATION_TOKENS: output tokens one public request may ask for in all, prompts x n x
+  max_tokens with an unset max_tokens counting as the full context (default 131072). As `bielik-one frontend`.
+  Routes that do not generate (tokenize, render, count_tokens, scoring, embeddings, rerank) are not counted.
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
   --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API
   process, so a shared value is required then (the server refuses to start without it).
@@ -100,6 +104,8 @@ class Settings:
     calibration: bool = True
     workers: int | None = None  # None: the value `bielik-one frontend` uses for the package
     max_body_mb: float = 16
+    max_generation_n: int | None = 16  # remote_vllm.DEFAULT_MAX_GENERATION_N
+    max_generation_tokens: int | None = 131_072  # remote_vllm.DEFAULT_MAX_GENERATION_TOKENS
 
     @classmethod
     def from_env(cls, env=None) -> "Settings":
@@ -114,6 +120,18 @@ class Settings:
             max_body_mb = float(env.get("SYSTEMONE_MAX_BODY_MB") or 16)
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
+        limits = {}
+        for name, field in (("SYSTEMONE_MAX_GENERATION_N", "max_generation_n"),
+                            ("SYSTEMONE_MAX_GENERATION_TOKENS", "max_generation_tokens")):
+            text = (env.get(name) or "").strip()
+            if not text:
+                continue
+            try:
+                limits[field] = None if text.lower() == "none" else int(text)
+            except ValueError:
+                raise RuntimeError(f"SystemOne middleware: {name} must be a whole number or none, got {text!r}")
+            if limits[field] is not None and limits[field] < 1:
+                raise RuntimeError(f"SystemOne middleware: {name} must be at least 1 (or none)")
         settings = cls(
             public_name=public,
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
@@ -124,6 +142,7 @@ class Settings:
             calibration=not _flag(env.get("SYSTEMONE_NO_CALIBRATION")),
             workers=workers,
             max_body_mb=max_body_mb,
+            **limits,
         )
         if env.get("SYSTEMONE_INTERNAL_TOKEN"):
             settings.internal_token = env["SYSTEMONE_INTERNAL_TOKEN"]
@@ -632,7 +651,7 @@ class SystemOneMiddleware:
     async def _guarded_post(self, scope, receive, send, *, next_app):
         """Client requests: the LoRA name, vllm_xargs and prompt logprobs are refused or removed."""
         from bielik_one.api.errors import INVALID_REQUEST, error_bytes
-        from bielik_one.api.remote_vllm import public_request_body
+        from bielik_one.api.remote_vllm import GenerationLimits, public_request_body
         from bielik_one.api.server import RequestError
 
         raw = await _read_body(receive)
@@ -640,7 +659,14 @@ class SystemOneMiddleware:
             return
         try:
             # A request without a model keeps none: vLLM answers it with its default served name, as without us.
-            body = public_request_body(_scrub_sampling_params(raw), {self.settings.lora_name}, None)
+            limits = GenerationLimits(
+                self.settings.max_generation_n,
+                self.settings.max_generation_tokens,
+                getattr(self.engine, "max_model_len", 32768),
+            )
+            body = public_request_body(
+                _scrub_sampling_params(raw), {self.settings.lora_name}, None, limits, scope.get("path")
+            )
         except RequestError as exc:
             return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, exc.msg, fmt="openai"))
         replayed = False

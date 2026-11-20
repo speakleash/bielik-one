@@ -562,6 +562,17 @@ def main(argv=None):
         help="frontend: largest request body in MiB, larger ones get HTTP 413 (default: 16)",
     )
     p.add_argument(
+        "--max-generation-n",
+        metavar="N",
+        help="frontend: largest n (or best_of) one chat/completions request may ask for; 'none' lifts it (default: 16)",
+    )
+    p.add_argument(
+        "--max-generation-tokens",
+        metavar="N",
+        help="frontend: output tokens one chat/completions request may ask for in all, prompts x n x max_tokens; "
+        "'none' lifts it (default: 131072)",
+    )
+    p.add_argument(
         "--error-format",
         choices=["default", "openai"],
         help='frontend: error bodies {"error", "code"} (default) or in the OpenAI format',
@@ -614,6 +625,9 @@ def main(argv=None):
         p.error("--kv-cache-gb must be positive")
     if a.max_body_mb is not None and not (math.isfinite(a.max_body_mb) and a.max_body_mb * 2**20 >= 1):
         p.error("--max-body-mb must be a finite size of at least one byte")
+    for flag, value in (("--max-generation-n", a.max_generation_n), ("--max-generation-tokens", a.max_generation_tokens)):
+        if value is not None and value.strip().lower() != "none" and not (value.strip().isdigit() and int(value) >= 1):
+            p.error(f"{flag} must be a whole number of at least 1, or none")
     try:
         root = resolve_package(a.package, a.revision)
     except ValueError as exc:
@@ -673,6 +687,9 @@ def main(argv=None):
             argv += ["--max-body-mb", str(a.max_body_mb)]
         if a.error_format is not None:
             argv += ["--error-format", a.error_format]
+        for flag, value in (("--max-generation-n", a.max_generation_n), ("--max-generation-tokens", a.max_generation_tokens)):
+            if value is not None:
+                argv += [flag, value]
         if a.max_num_seqs:
             workers = argv[argv.index("--workers") + 1]
             argv = override(argv, "--workers", max(int(workers), a.max_num_seqs))
