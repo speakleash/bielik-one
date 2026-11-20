@@ -30,6 +30,8 @@ reads, which carry a per-process secret header, use the adapter.
 
 Environment:
 - SYSTEMONE_PACKAGE (required): the adapter package directory; its checksums are verified at startup.
+- SYSTEMONE_MANIFEST_SHA256: optional; refuse to start unless the package's SHA256SUMS.json has this SHA-256 (as
+  `bielik-one ... --manifest-sha256`; `bielik-one backend <package> --dry-run` prints the value to record).
 - SYSTEMONE_MODEL_NAME: optional; restricts /v1/systemone to this one of the base model's served names (default:
   every name vLLM serves the base model under, i.e. all --served-model-name values).
 - SYSTEMONE_LORA_NAME: the adapter's --lora-modules name (default: decision, as printed by `bielik-one backend`).
@@ -83,6 +85,12 @@ BIND_RETRY_SECONDS = 5.0  # a failed setup check is answered from memory this lo
 log = logging.getLogger(__name__)
 
 
+def launch_sha256(value: str) -> bool:
+    from bielik_one.launch import SHA256_HEX
+
+    return bool(SHA256_HEX.fullmatch(value))
+
+
 def _flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -100,6 +108,7 @@ class Settings:
     calibration: bool = True
     workers: int | None = None  # None: the value `bielik-one frontend` uses for the package
     max_body_mb: float = 16
+    manifest_sha256: str | None = None  # SHA-256 of SHA256SUMS.json, obtained independently of the package
 
     @classmethod
     def from_env(cls, env=None) -> "Settings":
@@ -114,7 +123,11 @@ class Settings:
             max_body_mb = float(env.get("SYSTEMONE_MAX_BODY_MB") or 16)
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
+        manifest = (env.get("SYSTEMONE_MANIFEST_SHA256") or "").strip().lower() or None
+        if manifest is not None and not launch_sha256(manifest):
+            raise RuntimeError("SystemOne middleware: SYSTEMONE_MANIFEST_SHA256 must be 64 hexadecimal characters")
         settings = cls(
+            manifest_sha256=manifest,
             public_name=public,
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
             package=root,
@@ -158,7 +171,8 @@ def build_engine(settings: Settings):
     from bielik_one.api.remote_vllm import RemoteVllmEngine, resolve_calibration
 
     root = settings.package
-    launch.verify(root)
+    _, manifest = launch.check_manifest(root, settings.manifest_sha256)
+    launch.verify(root, manifest)
     kind = launch.detect(root)
     if kind not in ("llama-adapter", "qwen-adapter"):
         raise RuntimeError(f"{root}: a {kind} package; the middleware serves adapter packages (*-Adapter)")
