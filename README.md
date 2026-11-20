@@ -107,7 +107,7 @@ Errors have one shape, `{"error": "<message>", "code": "<CODE>"}`, with `detail`
 - `BACKEND_UNAVAILABLE` (502; 503 on `/health`) and `TIMEOUT` (504), when vLLM does not answer or not in time;
 - `INTERNAL_ERROR` (500).
 
-The chat routes answer errors in the OpenAI format, `{"error": {"message", "type", "param", "code"}}`, as vLLM itself does there. `bielik-one frontend ... --error-format openai` uses that format on every route except `/health`, which keeps `{"status", "error", "code"}` for load-balancer probes.
+The chat routes answer errors in the OpenAI format, `{"error": {"message", "type", "param", "code"}}`, as vLLM itself does there. `bielik-one frontend ... --error-format openai` uses that format on every route except `/health`, which keeps `{"status", "error", "code"}` for load-balancer probes. `/health`, `/ping` and `/v1/models` wait at most 5 seconds for vLLM (2 seconds to connect): a backend that accepts the connection but does not answer gives 503 on `/health` and 504 on `/v1/models` instead of holding the probe.
 
 Ordinary chat and completions go to `/v1/chat/completions` and `/v1/completions` on the same port, with the package's chat model alias (listed by `/v1/models`, e.g. `bielik-base`, `qwen-base` or `qwen-general`; requests without a model get it); the `decision` model is rejected there. Interactive docs: `/docs`.
 
