@@ -840,7 +840,7 @@ def answer_confidence(answer: Mapping) -> float:
 
 
 def build_app(engine: "LetterEngine", error_format: str = "default", *,
-              max_requests: int | None = None, request_timeout: float = 300):
+              max_requests: int | None = None, request_timeout: float | None = 300):
     """Typed decision endpoint for a ready engine. The vLLM frontend adds health, models and chat routes."""
     from fastapi import FastAPI, HTTPException
 
@@ -859,7 +859,8 @@ def build_app(engine: "LetterEngine", error_format: str = "default", *,
             ) from exc
 
     endpoint = systemone
-    if max_requests is not None:
+    # Either bound turns on the executor: max_requests gates concurrency, request_timeout bounds each request.
+    if max_requests is not None or request_timeout is not None:
         from fastapi import Request
         from bielik_one.api.request_execution import RequestExecutor
         from bielik_one.api.remote_vllm import install_backend_errors

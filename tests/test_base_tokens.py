@@ -217,3 +217,31 @@ def test_native_labels_temperature_preserves_scalar_calibration_contract():
     actual=engine.per_option_probability(tables,ids,orders,10.,1)
     assert actual==pytest.approx(apply_temperature([1-raw,raw],10.)[1])
     assert actual!=pytest.approx(score_orders(tables,ids,orders,10.)[1])
+
+
+@pytest.mark.parametrize('options,reads',[(2,1),(127,1),(128,1),(129,2),(255,2),(256,3)])
+def test_native_request_token_limit_counts_reads_like_the_transport(options,reads):
+    from types import SimpleNamespace
+    from bielik_one.api.remote_vllm import RemoteVllmEngine
+    choice=SimpleNamespace(options=[str(i) for i in range(options)],question=SimpleNamespace(type='choice'))
+    assert BaseTokenEngine(Tok(),None)._reads_per_prompt(choice)==reads
+    assert reads==VllmTokenReadout.read_count(list(range(options)))
+    # Adapter and merged engines send the anchor beside up to 127 options: 128 options take two reads there.
+    adapter=RemoteVllmEngine.__new__(RemoteVllmEngine);adapter.base_row_types=set()
+    assert adapter._reads_per_prompt(choice)==-(-options//127)
+
+
+def test_native_request_token_limit_does_not_overcount_128_options(monkeypatch):
+    import bielik_one.api.remote_vllm as remote
+    import bielik_one.api.server as server
+    letters=lambda tok,row,semantic:list(range(1000,1000+len(row.options)))
+    monkeypatch.setattr(remote,'answer_token_ids',letters);monkeypatch.setattr(server,'answer_token_ids',letters)
+    engine=BaseTokenEngine(Tok(),lambda tasks:[{i:0. for i in wanted} for _,wanted in tasks])
+    engine.capacity=255;engine.max_request_tokens=75
+    monkeypatch.setattr(engine,'prompt_ids',lambda row,**kwargs:[7]*50)
+    def body(n):
+        return SystemOneIn(model='decision',state='s',read_twice=False,questions={
+            'q':QuestionIn(type='choice',instructions='Pick',criteria={f'k{i}':str(i) for i in range(n)})})
+    assert len(engine.evaluate(body(128))['answers']['q']['probabilities'])==128  # one read of 50 tokens
+    with pytest.raises(RequestError,match='more than 75 prompt tokens'):
+        engine.evaluate(body(129))  # two reads, 100 tokens

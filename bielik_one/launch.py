@@ -527,7 +527,8 @@ def native_commands(root, component, args):
                "--backend-model", "base", "--host", args.host, "--port", str(args.port or 8026),
                "--workers", str(args.max_num_seqs or 8), "--decision-prefix", args.decision_prefix]
     for flag, value in [("--queue-size", args.read_queue_size), ("--max-requests", args.max_requests),
-                        ("--backend-timeout", args.backend_timeout), ("--request-timeout", args.request_timeout)]:
+                        ("--backend-timeout", args.backend_timeout), ("--request-timeout", args.request_timeout),
+                        ("--max-request-tokens", args.max_request_tokens)]:
         if value is not None:
             command += [flag, str(value)]
     if args.no_calibration:
@@ -556,7 +557,8 @@ def main(argv=None):
     p.add_argument("--read-queue-size", type=int, help="native frontend: queued reads beyond the worker pool (default: 64)")
     p.add_argument("--max-requests", type=int, help="native frontend: active processing requests (default: 32)")
     p.add_argument("--backend-timeout", type=float, help="native frontend: backend read timeout in seconds (default: 180)")
-    p.add_argument("--request-timeout", type=float, help="native frontend: processing deadline in seconds (default: 300)")
+    p.add_argument("--request-timeout", type=float, metavar="SECONDS",
+                   help="frontend: time one decision request may take; slower ones get HTTP 504 (default: 300)")
     p.add_argument("--native-tokens", action="store_true", help="untouched Bielik 3.2: read original answer tokens; no adapter or heads")
     p.add_argument("--decision-prefix", choices=["empty-think", "plain"], default="empty-think", help="native tokens only: assistant suffix (default: documented empty-think contract)")
     p.add_argument("--revision", help="revision of a Hugging Face repo id (default: main)")
@@ -637,6 +639,13 @@ def main(argv=None):
         help="frontend: largest request body in MiB, larger ones get HTTP 413 (default: 16)",
     )
     p.add_argument(
+        "--max-request-tokens",
+        type=int,
+        metavar="N",
+        help="frontend: prompt tokens one decision request may send in all; larger ones get HTTP 422 "
+        "(default: 4194304)",
+    )
+    p.add_argument(
         "--error-format",
         choices=["default", "openai"],
         help='frontend: error bodies {"error", "code"} (default) or in the OpenAI format',
@@ -689,18 +698,24 @@ def main(argv=None):
         p.error("--kv-cache-gb must be positive")
     if a.max_body_mb is not None and not (math.isfinite(a.max_body_mb) and a.max_body_mb * 2**20 >= 1):
         p.error("--max-body-mb must be a finite size of at least one byte")
+    if a.max_request_tokens is not None and a.max_request_tokens < 1:
+        p.error("--max-request-tokens must be at least 1")
+    if a.request_timeout is not None and not (math.isfinite(a.request_timeout) and a.request_timeout > 0):
+        p.error("--request-timeout must be a finite number of seconds greater than 0")
+    if (a.max_request_tokens is not None or a.request_timeout is not None) and a.component != "frontend":
+        p.error("--max-request-tokens and --request-timeout apply only to the frontend")
     if a.native_calibration is not None and (not a.native_tokens or a.component != "frontend"):
         p.error("--native-calibration applies only to frontend --native-tokens")
     if a.native_calibration is not None and a.no_calibration:
         p.error("--native-calibration conflicts with --no-calibration")
-    limits = (a.read_queue_size, a.max_requests, a.backend_timeout, a.request_timeout)
+    limits = (a.read_queue_size, a.max_requests, a.backend_timeout)
     if any(v is not None for v in limits) and (not a.native_tokens or a.component != "frontend"):
         p.error("native request limits apply only to 'frontend --native-tokens'")
     if a.read_queue_size is not None and not 0 <= a.read_queue_size <= 4096:
         p.error("--read-queue-size must be between 0 and 4096")
     if a.max_requests is not None and not 1 <= a.max_requests <= 256:
         p.error("--max-requests must be between 1 and 256")
-    if any(v is not None and (not math.isfinite(v) or v <= 0) for v in (a.backend_timeout,a.request_timeout)):
+    if a.backend_timeout is not None and (not math.isfinite(a.backend_timeout) or a.backend_timeout <= 0):
         p.error("native timeouts must be finite and positive")
     try:
         root = resolve_package(a.package, a.revision)
@@ -774,6 +789,10 @@ def main(argv=None):
             argv += ["--max-body-mb", str(a.max_body_mb)]
         if a.error_format is not None:
             argv += ["--error-format", a.error_format]
+        if a.max_request_tokens is not None:
+            argv += ["--max-request-tokens", str(a.max_request_tokens)]
+        if a.request_timeout is not None:
+            argv += ["--request-timeout", str(a.request_timeout)]
         if a.max_num_seqs:
             workers = argv[argv.index("--workers") + 1]
             argv = override(argv, "--workers", max(int(workers), a.max_num_seqs))

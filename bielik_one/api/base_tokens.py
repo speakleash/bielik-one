@@ -46,6 +46,10 @@ class BaseTokenEngine(RemoteVllmEngine):
         self.labels_capacity=0;self.parking=None;self.labels_threshold=.5;self.semantic=True
         self.temperatures={};self.calibration_source=None;self.reasoners={};self.aliases={model_name}
 
+    def _reads_per_prompt(self,row):
+        # The first answer token is the anchor, so only the other options take room in a read (as read_count counts).
+        return VllmTokenReadout.read_count(list(range(len(row.options))))
+
     def prompt_ids(self,row,**kwargs):
         if kwargs.pop('analysis',''):
             raise ValueError('Reasoning not supported by native base token readout')
@@ -96,6 +100,8 @@ def main():
     p.add_argument('--max-requests',type=int,default=32)
     p.add_argument('--backend-timeout',type=float,default=180)
     p.add_argument('--request-timeout',type=float,default=300)
+    from bielik_one.api.remote_vllm import DEFAULT_MAX_REQUEST_TOKENS, _positive_int
+    p.add_argument('--max-request-tokens',type=_positive_int,default=DEFAULT_MAX_REQUEST_TOKENS)
     p.add_argument('--decision-prefix',choices=['empty-think','plain'],default='empty-think')
     p.add_argument('--base-model',required=True);p.add_argument('--backend-url',required=True)
     p.add_argument('--backend-model',default='base');p.add_argument('--model-name',default='decision')
@@ -107,6 +113,7 @@ def main():
     if any(not math.isfinite(v) or v <= 0 for v in (a.backend_timeout,a.request_timeout)): p.error('timeouts must be finite and positive')
     tok=AutoTokenizer.from_pretrained(a.base_model,local_files_only=True)
     engine=BaseTokenEngine(tok,VllmTokenReadout(a.backend_url,a.backend_model,workers=a.workers,queue_size=a.queue_size,timeout=a.backend_timeout),model_name=a.model_name,max_model_len=a.max_model_len,empty_think=a.decision_prefix=='empty-think')
+    engine.max_request_tokens=a.max_request_tokens
     try:
         if a.calibration is not None and a.no_calibration:
             raise ValueError('Explicit calibration conflicts with disabled calibration')

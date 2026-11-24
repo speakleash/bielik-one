@@ -37,6 +37,12 @@ from bielik_one.api.vllm_reads import (
     MAX_LOGPROB_TOKEN_IDS, BackendReadError, BackendBusyError, VllmReadTransport, conditional_logprobs, check_cancelled
 )
 
+# Prompt tokens the decision reads of one request may send in all. 64 questions over a 32k-token state is about 2.1M;
+# the cap leaves room for two option orders of that.
+DEFAULT_MAX_REQUEST_TOKENS = 4_194_304
+# Wall-clock budget for one /v1/systemone request (server.build_app enforces it).
+DEFAULT_REQUEST_TIMEOUT = 300.0
+
 # Request-local collection: concurrent requests must never share inference metadata.
 _prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
 
@@ -133,6 +139,9 @@ def package_dir(metadata_path, wanted: str) -> Path:
 class RemoteVllmEngine(LetterEngine):
     strict_read_twice_context = False
     report_output_reads = True
+    # Defaults for subclasses that do not run __init__ (the native token engine).
+    max_request_tokens = DEFAULT_MAX_REQUEST_TOKENS
+    base_row_types = frozenset()
 
     def load_calibration(self,path):
         self.temperatures=load_calibration(path)
@@ -160,8 +169,13 @@ class RemoteVllmEngine(LetterEngine):
         workers=8,
         calibration=None,
         calibration_source=None,
+        max_request_tokens=DEFAULT_MAX_REQUEST_TOKENS,
     ):
         from transformers import AutoTokenizer
+
+        if max_request_tokens is not None and max_request_tokens < 1:
+            raise ValueError("max_request_tokens must be at least 1")
+        self.max_request_tokens = max_request_tokens
 
         self.tok = (
             tokenizer
@@ -238,6 +252,10 @@ class RemoteVllmEngine(LetterEngine):
         read also carries the anchor and, on flagged base rows, the canary."""
         return MAX_LOGPROB_TOKEN_IDS - 1 - (1 if on_base else 0)
 
+    def _reads_per_prompt(self, row) -> int:
+        """Backend reads _read() makes for one prompt of this row: the anchor travels separately from the options."""
+        return -(-len(row.options) // self._chunk_width(row.question.type in self.base_row_types))
+
     def _read(self, prompt: list[int], output_ids: list[int], kind: str):
         anchor = int(self.parking["anchor_id"])
         on_base = kind in self.base_row_types
@@ -270,6 +288,8 @@ class RemoteVllmEngine(LetterEngine):
         if first_rows and len(first_rows) != len(orders):
             raise ValueError("Expected one original row per decision read")
         standard = []
+        chunks = []  # backend reads per prompt: _read() sends the prompt once per chunk of output ids
+        sent_tokens = 0
         groups = {}
         for index, row in enumerate(orders):
             check_cancelled()
@@ -286,6 +306,17 @@ class RemoteVllmEngine(LetterEngine):
             )
             if len(ids) + 1 > self.max_model_len:
                 raise RequestError(["questions", row.id], CONTEXT_LIMIT)
+            # Checked while the prompts are built, so an oversized request stops before it holds them all. Questions
+            # with more options than one read can carry count once per read.
+            chunks.append(self._reads_per_prompt(row))
+            sent_tokens += len(ids) * chunks[-1]
+            if self.max_request_tokens is not None and sent_tokens > self.max_request_tokens:
+                raise RequestError(
+                    ["questions"],
+                    f"the decision reads of this request need more than {self.max_request_tokens} prompt tokens "
+                    "in all (questions x option orders x prompt length); send fewer questions or option orders, "
+                    "or a shorter state",
+                )
             standard.append(ids)
             groups.setdefault(row.id, []).append(index)
 
@@ -304,14 +335,19 @@ class RemoteVllmEngine(LetterEngine):
                         questions=questions, questions_before_state=questions_before_state,
                         read_twice=True, analysis=(analyses or {}).get(name, ""),
                     ) for i in indices]
-                    if all(len(ids) + 1 <= self.max_model_len for ids in repeated):
+                    extra = sum((len(ids) - len(standard[i])) * chunks[i] for i, ids in zip(indices, repeated))
+                    if not all(len(ids) + 1 <= self.max_model_len for ids in repeated):
+                        if self.strict_read_twice_context:
+                            raise RequestError(["questions", name], CONTEXT_LIMIT)
+                        reason = "context_limit"
+                    elif self.max_request_tokens is not None and sent_tokens + extra > self.max_request_tokens:
+                        # The limit counts what is sent: this question keeps the standard prompt instead.
+                        reason = "request_token_limit"
+                    else:
                         reason = "applied"
+                        sent_tokens += extra
                         for i, ids in zip(indices, repeated, strict=True):
                             selected[i] = ids
-                    else:
-                        if self.strict_read_twice_context:
-                            raise RequestError(["questions",name],CONTEXT_LIMIT)
-                        reason = "context_limit"
             decisions[name] = reason
 
         tasks = []
@@ -453,7 +489,7 @@ def install_backend_errors(app, error_format: str = "default"):
 
 def build_remote_app(
     engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default",
-    *, max_requests: int | None = None, request_timeout: float = 300
+    *, max_requests: int | None = None, request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT
 ):
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from starlette.background import BackgroundTask
@@ -584,6 +620,45 @@ def add_calibration_arguments(parser):
     )
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError("must be a finite number of seconds greater than 0")
+    return value
+
+
+def add_limit_arguments(parser):
+    parser.add_argument(
+        "--max-request-tokens",
+        type=_positive_int,
+        default=DEFAULT_MAX_REQUEST_TOKENS,
+        help="prompt tokens the decision reads of one /v1/systemone request may send in all; a request over it with "
+        "standard prompts gets HTTP 422, and read twice is skipped for questions that would push it over "
+        f"(default: {DEFAULT_MAX_REQUEST_TOKENS})",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=_positive_seconds,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="seconds one /v1/systemone request may take, from admission to the last decision read; slower ones get "
+        "HTTP 504 "
+        f"(default: {DEFAULT_REQUEST_TIMEOUT:g})",
+    )
+
+
 def main():
     import uvicorn
     from bielik_one.api.reasoning import EndpointReasoner
@@ -601,6 +676,7 @@ def main():
     )
     add_calibration_arguments(parser)
     add_guard_arguments(parser)
+    add_limit_arguments(parser)
     args = parser.parse_args()
     metadata = json.loads(args.metadata.read_text())
     table, source = resolve_calibration(
@@ -618,13 +694,17 @@ def main():
         workers=args.workers,
         calibration=table,
         calibration_source=source,
+        max_request_tokens=args.max_request_tokens,
     )
     engine.reasoners["original"] = EndpointReasoner(
         args.backend_url + "/v1", args.base_model, tok=getattr(engine, "tok", None)
     )
     uvicorn.run(
         guarded(
-            build_remote_app(engine, chat_model=args.base_model, error_format=args.error_format),
+            build_remote_app(
+                engine, chat_model=args.base_model, error_format=args.error_format,
+                request_timeout=args.request_timeout,
+            ),
             args.max_body_mb,
             args.error_format,
         ),

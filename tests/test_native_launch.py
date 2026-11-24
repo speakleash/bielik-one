@@ -49,8 +49,8 @@ def test_native_limits_forwarded_and_old_profiles_not_silently_affected(tmp_path
     assert cmd[cmd.index('--queue-size')+1]=='10' and cmd[cmd.index('--max-requests')+1]=='4'
     assert cmd[cmd.index('--backend-timeout')+1]=='30.0' and cmd[cmd.index('--request-timeout')+1]=='60.0'
     with pytest.raises(ValueError,match='only to'):
-        dry('frontend',root,'--request-timeout','60')
-    with pytest.raises(ValueError,match='finite and positive'):
+        dry('frontend',root,'--backend-timeout','30')
+    with pytest.raises(ValueError,match='finite'):
         dry('frontend',root,'--native-tokens','--request-timeout','nan')
 
 

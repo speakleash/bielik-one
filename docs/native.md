@@ -55,7 +55,8 @@ deadline including admission. Configure them on the native frontend with `--max-
 Admission overload returns 503 with `Retry-After: 1`; timeouts return 504.
 Disconnect cancellation stops queued/future reads; already running synchronous
 calls retain their slots until completion or timeout. Existing body limits and
-error formats apply. Native request-limit flags are rejected for other profiles.
+error formats apply. `--read-queue-size`, `--max-requests` and `--backend-timeout` are
+rejected for other profiles; `--request-timeout` applies to every frontend.
 
 BF16 is the default. `--fp8` enables on-load FP8 with an unquantized lm_head.
 Prequantized FP8 checkpoints are detected by vLLM without this flag. Prefix
@@ -108,7 +109,7 @@ proxy. The default middleware mode remains `adapter`.
 Native processing bounds use `SYSTEMONE_WORKERS` (8),
 `SYSTEMONE_READ_QUEUE_SIZE` (64), `SYSTEMONE_MAX_REQUESTS` (32),
 `SYSTEMONE_BACKEND_TIMEOUT` (180 seconds) and `SYSTEMONE_REQUEST_TIMEOUT`
-(300 seconds). These reuse the frontend's bounded pool, overload errors,
+(300 seconds; it also applies in adapter mode). These reuse the frontend's bounded pool, overload errors,
 deadlines and cooperative cancellation. The actual vLLM context limit is
 reflected in prompt metadata and context errors.
 

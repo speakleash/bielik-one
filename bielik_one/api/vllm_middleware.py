@@ -34,7 +34,7 @@ Environment:
 - SYSTEMONE_PACKAGE (required): the adapter package directory, or the original checkpoint for native mode.
   Adapter checksums are verified at startup; original native checkpoints have no package checksum manifest.
 - Native-only: SYSTEMONE_DECISION_PREFIX (empty-think/default or plain), SYSTEMONE_READ_QUEUE_SIZE (64),
-  SYSTEMONE_MAX_REQUESTS (32), SYSTEMONE_BACKEND_TIMEOUT (180 seconds), SYSTEMONE_REQUEST_TIMEOUT (300 seconds).
+  SYSTEMONE_MAX_REQUESTS (32), SYSTEMONE_BACKEND_TIMEOUT (180 seconds).
   Native mode supports BF16 and opt-in FP8, no LoRA, raw_logprobs and max_logprobs >=128 (or unlimited).
 - SYSTEMONE_MODEL_NAME: optional; restricts /v1/systemone to this one of the base model's served names (default:
   every name vLLM serves the base model under, i.e. all --served-model-name values).
@@ -48,6 +48,9 @@ Environment:
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
 - SYSTEMONE_MAX_BODY_MB: largest decision or public request body (default 16); form uploads are not limited here.
+- SYSTEMONE_MAX_REQUEST_TOKENS: prompt tokens the decision reads of one request may send in all (default 4194304), as
+  with `bielik-one frontend --max-request-tokens`.
+- SYSTEMONE_REQUEST_TIMEOUT: seconds one decision request may take (default 300); slower ones get 504.
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
   --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API
   process, so a shared value is required then (the server refuses to start without it).
@@ -107,12 +110,13 @@ class Settings:
     calibration: bool = True
     workers: int | None = None  # None: the value `bielik-one frontend` uses for the package
     max_body_mb: float = 16
+    max_request_tokens: int = 4_194_304  # remote_vllm.DEFAULT_MAX_REQUEST_TOKENS
     mode: str = "adapter"
     decision_prefix: str = "empty-think"
     queue_size: int = 64
     max_requests: int = 32
     backend_timeout: float = 180
-    request_timeout: float = 300
+    request_timeout: float = 300  # remote_vllm.DEFAULT_REQUEST_TIMEOUT
     native_calibration: str | None = None
 
     @classmethod
@@ -132,9 +136,15 @@ class Settings:
             queue_size = int(env.get("SYSTEMONE_READ_QUEUE_SIZE", "64"))
             max_requests = int(env.get("SYSTEMONE_MAX_REQUESTS", "32"))
             backend_timeout = float(env.get("SYSTEMONE_BACKEND_TIMEOUT", "180"))
-            request_timeout = float(env.get("SYSTEMONE_REQUEST_TIMEOUT", "300"))
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
+        try:
+            max_request_tokens = int(env.get("SYSTEMONE_MAX_REQUEST_TOKENS") or cls.max_request_tokens)
+            request_timeout = float(env.get("SYSTEMONE_REQUEST_TIMEOUT") or cls.request_timeout)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"SystemOne middleware: invalid SYSTEMONE_MAX_REQUEST_TOKENS or SYSTEMONE_REQUEST_TIMEOUT ({exc})"
+            )
         settings = cls(
             mode=mode, native_calibration=env.get("SYSTEMONE_NATIVE_CALIBRATION") or None,
             public_name=public,
@@ -146,6 +156,7 @@ class Settings:
             calibration=not _flag(env.get("SYSTEMONE_NO_CALIBRATION")),
             workers=workers,
             max_body_mb=max_body_mb,
+            max_request_tokens=max_request_tokens,
             decision_prefix=env.get("SYSTEMONE_DECISION_PREFIX") or "empty-think",
             queue_size=queue_size, max_requests=max_requests,
             backend_timeout=backend_timeout, request_timeout=request_timeout,
@@ -161,15 +172,19 @@ class Settings:
             raise RuntimeError("SYSTEMONE_WORKERS must be between 1 and 256")
         if not math.isfinite(settings.max_body_mb) or settings.max_body_mb * 2**20 < 1:
             raise RuntimeError("SYSTEMONE_MAX_BODY_MB must be finite and at least one byte")
+        if settings.max_request_tokens < 1:
+            raise RuntimeError("SYSTEMONE_MAX_REQUEST_TOKENS must be at least 1")
+        if not (math.isfinite(settings.request_timeout) and settings.request_timeout > 0):
+            raise RuntimeError("SYSTEMONE_REQUEST_TIMEOUT must be a finite number of seconds greater than 0")
         native_options = ("SYSTEMONE_NATIVE_CALIBRATION", "SYSTEMONE_DECISION_PREFIX", "SYSTEMONE_READ_QUEUE_SIZE", "SYSTEMONE_MAX_REQUESTS",
-                          "SYSTEMONE_BACKEND_TIMEOUT", "SYSTEMONE_REQUEST_TIMEOUT")
+                          "SYSTEMONE_BACKEND_TIMEOUT")
         if mode == "adapter" and any(name in env for name in native_options):
             raise RuntimeError("native request settings require SYSTEMONE_MODE=native")
         if settings.decision_prefix not in ("plain", "empty-think"):
             raise RuntimeError("SYSTEMONE_DECISION_PREFIX must be plain or empty-think")
         if not 0 <= settings.queue_size <= 4096 or not 1 <= settings.max_requests <= 256:
             raise RuntimeError("native queue size must be 0..4096 and max requests 1..256")
-        if any(not math.isfinite(x) or x <= 0 for x in (backend_timeout, request_timeout)):
+        if not math.isfinite(backend_timeout) or backend_timeout <= 0:
             raise RuntimeError("native timeouts must be finite and positive")
         return settings
 
@@ -243,6 +258,7 @@ def build_engine(settings: Settings):
             calibration=table,
             calibration_source=source,
             client=client,
+            max_request_tokens=settings.max_request_tokens,
         )
     except BaseException:
         client.close()
@@ -287,6 +303,7 @@ def _build_native_engine(settings):
                                   queue_size=settings.queue_size, timeout=settings.backend_timeout, client=client)
         engine = BaseTokenEngine(tok, reader, model_name="unbound",
                                  empty_think=settings.decision_prefix == "empty-think")
+        engine.max_request_tokens = settings.max_request_tokens
         if settings.native_calibration is not None and not settings.calibration:
             raise ValueError('Explicit native calibration conflicts with disabled calibration')
         engine.temperatures,engine.calibration_source=resolve_calibration(root/'config.json',settings.native_calibration,not settings.calibration)

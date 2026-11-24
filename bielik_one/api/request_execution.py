@@ -8,27 +8,34 @@ from fastapi.responses import Response
 from bielik_one.api.vllm_reads import BackendReadError, BackendBusyError, _cancel_event
 
 
+class _NoGate:
+    """Stands in for the semaphore when concurrency is not bounded (max_requests None)."""
+    async def acquire(self):return True
+    def release(self):pass
+
+
 class RequestExecutor:
     def __init__(self,max_requests,timeout):
-        if not 1<=max_requests<=256:raise ValueError('max_requests must be between 1 and 256')
-        if not math.isfinite(timeout) or timeout<=0:raise ValueError('request_timeout must be finite and positive')
-        self.gate=asyncio.Semaphore(max_requests)
+        if max_requests is not None and not 1<=max_requests<=256:raise ValueError('max_requests must be between 1 and 256')
+        if timeout is not None and (not math.isfinite(timeout) or timeout<=0):raise ValueError('request_timeout must be finite and positive')
+        self.gate=_NoGate() if max_requests is None else asyncio.Semaphore(max_requests)
         self.timeout=timeout
 
     async def run(self,evaluate,body,request):
         loop=asyncio.get_running_loop()
-        deadline=loop.time()+self.timeout
+        deadline=None if self.timeout is None else loop.time()+self.timeout
+        expired=lambda:deadline is not None and loop.time()>=deadline
         try:
-            await asyncio.wait_for(self.gate.acquire(),timeout=min(1.,self.timeout))
+            await asyncio.wait_for(self.gate.acquire(),timeout=1. if self.timeout is None else min(1.,self.timeout))
         except TimeoutError as exc:
-            if loop.time()>=deadline:
+            if expired():
                 raise BackendReadError('Decision request deadline exceeded') from httpx.ReadTimeout('Decision request deadline exceeded')
             raise BackendBusyError('Decision request queue is full; retry later') from exc
         try:
             if await request.is_disconnected():
                 self.gate.release()
                 return Response(status_code=499)
-            if loop.time()>=deadline:
+            if expired():
                 raise BackendReadError('Decision request deadline exceeded') from httpx.ReadTimeout('Decision request deadline exceeded')
         except BaseException:
             self.gate.release();raise
@@ -47,7 +54,7 @@ class RequestExecutor:
             while not await request.is_disconnected():await asyncio.sleep(.1)
         watcher=asyncio.create_task(disconnected())
         try:
-            done,_=await asyncio.wait((work,watcher),timeout=max(0.,deadline-loop.time()),return_when=asyncio.FIRST_COMPLETED)
+            done,_=await asyncio.wait((work,watcher),timeout=None if deadline is None else max(0.,deadline-loop.time()),return_when=asyncio.FIRST_COMPLETED)
             if not done:
                 raise BackendReadError('Decision request deadline exceeded') from httpx.ReadTimeout('Decision request deadline exceeded')
             if work in done:return work.result()
