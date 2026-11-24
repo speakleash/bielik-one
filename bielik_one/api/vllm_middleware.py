@@ -33,6 +33,8 @@ Environment:
 - SYSTEMONE_MODE: adapter (default) or native (original Bielik 3.2 answer tokens).
 - SYSTEMONE_PACKAGE (required): the adapter package directory, or the original checkpoint for native mode.
   Adapter checksums are verified at startup; original native checkpoints have no package checksum manifest.
+- SYSTEMONE_MANIFEST_SHA256: optional, adapter mode only; refuse to start unless the package's SHA256SUMS.json has
+  this SHA-256 (as `bielik-one ... --manifest-sha256`; `bielik-one backend <package> --dry-run` prints the value).
 - Native-only: SYSTEMONE_DECISION_PREFIX (empty-think/default or plain), SYSTEMONE_READ_QUEUE_SIZE (64),
   SYSTEMONE_MAX_REQUESTS (32), SYSTEMONE_BACKEND_TIMEOUT (180 seconds), SYSTEMONE_REQUEST_TIMEOUT (300 seconds).
   Native mode supports BF16 and opt-in FP8, no LoRA, raw_logprobs and max_logprobs >=128 (or unlimited).
@@ -90,6 +92,12 @@ BIND_RETRY_SECONDS = 5.0  # a failed setup check is answered from memory this lo
 log = logging.getLogger(__name__)
 
 
+def launch_sha256(value: str) -> bool:
+    from bielik_one.launch import SHA256_HEX
+
+    return bool(SHA256_HEX.fullmatch(value))
+
+
 def _flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -107,6 +115,7 @@ class Settings:
     calibration: bool = True
     workers: int | None = None  # None: the value `bielik-one frontend` uses for the package
     max_body_mb: float = 16
+    manifest_sha256: str | None = None  # SHA-256 of SHA256SUMS.json, obtained independently of the package
     mode: str = "adapter"
     decision_prefix: str = "empty-think"
     queue_size: int = 64
@@ -135,7 +144,16 @@ class Settings:
             request_timeout = float(env.get("SYSTEMONE_REQUEST_TIMEOUT", "300"))
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
+        manifest = (env.get("SYSTEMONE_MANIFEST_SHA256") or "").strip().lower() or None
+        if manifest is not None and not launch_sha256(manifest):
+            raise RuntimeError("SystemOne middleware: SYSTEMONE_MANIFEST_SHA256 must be 64 hexadecimal characters")
+        if manifest is not None and mode == "native":
+            raise RuntimeError(
+                "SystemOne middleware: SYSTEMONE_MANIFEST_SHA256 does not apply to native mode; "
+                "original checkpoints have no SHA256SUMS.json"
+            )
         settings = cls(
+            manifest_sha256=manifest,
             mode=mode, native_calibration=env.get("SYSTEMONE_NATIVE_CALIBRATION") or None,
             public_name=public,
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
@@ -195,7 +213,8 @@ def build_engine(settings: Settings):
     root = settings.package
     if settings.mode == "native":
         return _build_native_engine(settings)
-    launch.verify(root)
+    _, sums = launch.check_manifest(root, settings.manifest_sha256)
+    launch.verify(root, sums)
     kind = launch.detect(root)
     if kind not in ("llama-adapter", "qwen-adapter"):
         raise RuntimeError(f"{root}: a {kind} package; the middleware serves adapter packages (*-Adapter)")

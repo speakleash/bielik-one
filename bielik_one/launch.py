@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import math
 import os
+import re
 import shlex
 from pathlib import Path, PurePosixPath
 import sys
@@ -61,6 +63,40 @@ PORTS = {
 NON_RUNTIME_FILES = frozenset({".gitattributes", "LICENSE", "README.md", "requirements.txt"})
 
 
+# A Hugging Face commit id: unlike a branch or tag name, it always names the same files.
+FULL_REVISION = re.compile(r"[0-9a-f]{40}")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def read_manifest(root: Path) -> bytes:
+    path = root / "SHA256SUMS.json"
+    if not path.is_file():
+        raise ValueError("SHA256SUMS.json is missing; download the complete repository")
+    return path.read_bytes()
+
+
+def check_manifest(root: Path, expected: str | None) -> tuple[str, bytes]:
+    """The manifest's digest and bytes; with `expected` (obtained independently of the package), they must match.
+
+    verify() checks the files against SHA256SUMS.json, which travels with them: a package republished together with
+    a matching manifest passes it. A digest recorded from a trusted source closes that gap. Pass the returned bytes
+    to verify(), so the manifest that was pinned is the one the files are checked against.
+    """
+    raw = read_manifest(root)
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected is not None and not hmac.compare_digest(digest, expected.lower()):
+        raise ValueError(
+            f"SHA256SUMS.json has SHA-256 {digest}, not the pinned {expected.lower()}; "
+            "this is not the package you pinned"
+        )
+    return digest, raw
+
+
+def snapshot_revision(root: Path) -> str | None:
+    """The commit id of a Hugging Face cache snapshot (snapshots/<commit>/), or None for any other directory."""
+    return root.name if root.parent.name == "snapshots" and FULL_REVISION.fullmatch(root.name) else None
+
+
 def resolve_package(spec: str, revision: str | None = None) -> Path:
     """A local package directory, or a Hugging Face repo id downloaded (or reused) in the HF cache."""
     path = Path(spec).expanduser()
@@ -75,12 +111,9 @@ def resolve_package(spec: str, revision: str | None = None) -> Path:
     raise ValueError(f"{spec}: not a package directory or a Hugging Face repo id")
 
 
-def verify(root: Path) -> dict:
+def verify(root: Path, manifest: bytes | None = None) -> dict:
     """Verify runtime files and all weights; ignore only known root-level auxiliary files."""
-    path = root / "SHA256SUMS.json"
-    if not path.is_file():
-        raise ValueError("SHA256SUMS.json is missing; download the complete repository")
-    sums = json.loads(path.read_text())
+    sums = json.loads(manifest if manifest is not None else read_manifest(root))
     for relative, expected in sums.items():
         # Checked by name, not by resolving: HF cache snapshots are symlinks into blobs/.
         pure = PurePosixPath(relative)
@@ -573,6 +606,18 @@ def main(argv=None):
         help="removed: tool and reasoning parsers are required for adapter/native vLLM serving",
     )
     p.add_argument(
+        "--manifest-sha256",
+        metavar="HEX",
+        help="refuse the package unless its SHA256SUMS.json has this SHA-256 (record it once from a trusted source; "
+        "--dry-run prints it)",
+    )
+    p.add_argument(
+        "--require-pinned-revision",
+        action="store_true",
+        help="refuse a Hugging Face repo id without --revision set to a full 40-character commit id, and a local "
+        "directory without --manifest-sha256",
+    )
+    p.add_argument(
         "--host",
         default="127.0.0.1",
         help="frontend bind address (the typed API and the chat proxy)",
@@ -689,6 +734,22 @@ def main(argv=None):
         p.error("--kv-cache-gb must be positive")
     if a.max_body_mb is not None and not (math.isfinite(a.max_body_mb) and a.max_body_mb * 2**20 >= 1):
         p.error("--max-body-mb must be a finite size of at least one byte")
+    if a.manifest_sha256 is not None and not SHA256_HEX.fullmatch(a.manifest_sha256.lower()):
+        p.error("--manifest-sha256 must be 64 hexadecimal characters")
+    if a.require_pinned_revision:
+        # Checked before anything is downloaded.
+        if Path(a.package).expanduser().is_dir():
+            if a.native_tokens:
+                p.error("--require-pinned-revision: a local native checkpoint has no revision or manifest to pin")
+            if a.manifest_sha256 is None:
+                p.error("--require-pinned-revision: a local directory has no revision; pass --manifest-sha256")
+        elif a.revision is None or not FULL_REVISION.fullmatch(a.revision):
+            p.error(
+                "--require-pinned-revision: pass --revision with the full 40-character commit id "
+                f"(got {a.revision or 'none, which means main'}); a branch, tag or short id can change"
+            )
+    if a.manifest_sha256 is not None and a.native_tokens:
+        p.error("--manifest-sha256 does not apply to --native-tokens: original checkpoints have no SHA256SUMS.json")
     if a.native_calibration is not None and (not a.native_tokens or a.component != "frontend"):
         p.error("--native-calibration applies only to frontend --native-tokens")
     if a.native_calibration is not None and a.no_calibration:
@@ -724,7 +785,8 @@ def main(argv=None):
     if a.decision_prefix != "empty-think":
         p.error("--decision-prefix applies only to --native-tokens")
     try:
-        verify(root)
+        digest, manifest = check_manifest(root, a.manifest_sha256)
+        verify(root, manifest)
         kind = detect(root)
     except (ValueError, FileNotFoundError) as exc:
         p.error(f"{root}: {exc}")
@@ -792,6 +854,9 @@ def main(argv=None):
                     "command": argv,
                     "env": launch_env,
                     "checksums_verified": True,
+                    "revision": snapshot_revision(root),
+                    "manifest_sha256": digest,
+                    "manifest_pinned": a.manifest_sha256 is not None,
                 },
                 indent=2,
             )
