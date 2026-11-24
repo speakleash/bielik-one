@@ -136,7 +136,7 @@ Errors have one shape, `{"error": "<message>", "code": "<CODE>"}`, with `detail`
 
 Overloaded bounded native requests return 503 with `Retry-After: 1`.
 
-The chat routes answer errors in the OpenAI format, `{"error": {"message", "type", "param", "code"}}`, as vLLM itself does there. `bielik-one frontend ... --error-format openai` uses that format on every route except `/health`, which keeps `{"status", "error", "code"}` for load-balancer probes.
+The chat routes answer errors in the OpenAI format, `{"error": {"message", "type", "param", "code"}}`, as vLLM itself does there. `bielik-one frontend ... --error-format openai` uses that format on every route except `/health`, which keeps `{"status", "error", "code"}` for load-balancer probes. `/health`, `/ping` and `/v1/models` wait at most 5 seconds for vLLM (2 seconds to connect): a backend that accepts the connection but does not answer gives 503 on `/health` and 504 on `/v1/models` instead of holding the probe.
 
 ## Chat and completions
 
