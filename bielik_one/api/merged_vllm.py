@@ -1,7 +1,7 @@
 """Typed decisions + masked chat over an ordinary plugin-free merged vLLM."""
 
 from __future__ import annotations
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import httpx, uvicorn
 from bielik_one.api.remote_vllm import (
@@ -12,7 +12,7 @@ from bielik_one.api.remote_vllm import (
     resolve_calibration,
 )
 from bielik_one.api.errors import INVALID_REQUEST, error_response
-from bielik_one.api.http_guard import add_guard_arguments, guarded
+from bielik_one.api.http_guard import add_guard_arguments, exposure_warning, guarded
 from bielik_one.api.reasoning import EndpointReasoner
 
 
@@ -144,6 +144,8 @@ def main():
         build_remote_app(engine, chat_model=a.base_model, error_format=a.error_format),
         meta["chat_blocked_tokens"],
     )
+    if warning := exposure_warning(a.host):
+        print(warning, file=sys.stderr, flush=True)
     uvicorn.run(guarded(app, a.max_body_mb, a.error_format), host=a.host, port=a.port)
 
 
