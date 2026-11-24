@@ -89,8 +89,9 @@ def main():
     from bielik_one.api.http_guard import add_guard_arguments, guarded
     p=argparse.ArgumentParser(description=__doc__)
     add_guard_arguments(p)
-    from bielik_one.api.remote_vllm import add_calibration_arguments
+    from bielik_one.api.remote_vllm import add_calibration_arguments, add_generation_arguments, generation_limits
     add_calibration_arguments(p)
+    add_generation_arguments(p)
     p.add_argument('--workers',type=int,default=8)
     p.add_argument('--queue-size',type=int,default=64)
     p.add_argument('--max-requests',type=int,default=32)
@@ -114,7 +115,7 @@ def main():
     except (ValueError,OSError) as exc:
         engine.close();p.error(str(exc))
     engine.backend_url=a.backend_url.rstrip('/')
-    uvicorn.run(guarded(build_remote_app(engine,chat_model=a.backend_model,error_format=a.error_format,max_requests=a.max_requests,request_timeout=a.request_timeout),a.max_body_mb,a.error_format),host=a.host,port=a.port)
+    uvicorn.run(guarded(build_remote_app(engine,chat_model=a.backend_model,error_format=a.error_format,generation_limits=generation_limits(a,a.max_model_len),max_requests=a.max_requests,request_timeout=a.request_timeout),a.max_body_mb,a.error_format),host=a.host,port=a.port)
 
 
 if __name__=='__main__':main()

@@ -127,3 +127,19 @@ def test_native_missing_parser_checkout_fails_before_start(tmp_path,monkeypatch)
     monkeypatch.delenv('BIELIK_TOOLS_DIR')
     with pytest.raises(ValueError,match='parsers are required'):
         dry('backend',original(tmp_path),'--native-tokens')
+
+
+def test_native_frontend_passes_generation_limits(tmp_path):
+    root=original(tmp_path)
+    cmd=dry('frontend',root,'--native-tokens')['command']
+    assert '--max-generation-n' not in cmd and '--max-generation-tokens' not in cmd
+    cmd=dry('frontend',root,'--native-tokens','--max-generation-n','4','--max-generation-tokens','none')['command']
+    assert cmd[cmd.index('--max-generation-n')+1]=='4'
+    assert cmd[cmd.index('--max-generation-tokens')+1]=='none'
+
+
+def test_native_frontend_accepts_generation_limits():
+    import subprocess,sys
+    pytest.importorskip('transformers')
+    out=subprocess.run([sys.executable,'-m','bielik_one.api.base_tokens','--help'],capture_output=True,text=True,check=True).stdout
+    assert '--max-generation-n' in out and '--max-generation-tokens' in out

@@ -7,7 +7,9 @@ import httpx, uvicorn
 from bielik_one.api.remote_vllm import (
     RemoteVllmEngine,
     add_calibration_arguments,
+    add_generation_arguments,
     build_remote_app,
+    generation_limits,
     package_dir,
     resolve_calibration,
 )
@@ -109,6 +111,7 @@ def main():
     p.add_argument("--base-model", default="qwen-general")
     add_calibration_arguments(p)
     add_guard_arguments(p)
+    add_generation_arguments(p)
     a = p.parse_args()
     meta = json.loads(a.metadata.read_text())
     meta["base_snapshot"] = str(package_dir(a.metadata, "tokenizer_config.json"))
@@ -141,7 +144,10 @@ def main():
         f"http://{own}:{a.port}/v1", a.base_model, tok=getattr(engine, "tok", None)
     )
     app = MaskChatTokens(
-        build_remote_app(engine, chat_model=a.base_model, error_format=a.error_format),
+        build_remote_app(
+            engine, chat_model=a.base_model, error_format=a.error_format,
+            generation_limits=generation_limits(a, getattr(engine, "max_model_len", 32768)),
+        ),
         meta["chat_blocked_tokens"],
     )
     uvicorn.run(guarded(app, a.max_body_mb, a.error_format), host=a.host, port=a.port)
